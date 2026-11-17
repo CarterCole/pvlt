@@ -1,0 +1,19 @@
+{
+  "name": "@pvlt/client",
+  "version": "0.1.0",
+  "description": "Client-side encryption and decryption of pvlt blobs (suite 0x0003, AES-256-GCM) with WebCrypto, and a small API client. Pre-alpha: do not use with real personal data.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/pvlt.ts",
+  "exports": {
+    ".": "./src/pvlt.ts",
+    "./blob": "./src/blob.ts"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "keywords": ["pii", "encryption", "webcrypto", "pvlt"]
+}

@@ -1,0 +1,102 @@
+{
+ "format": "pvlt-v1",
+ "description": "HKDF info, ek, ck and nonces for every suite (FORMAT.md section 3)",
+ "vectors": [
+  {
+   "name": "PVLT-XC20P-HS256 object",
+   "suite": 1,
+   "label": "object",
+   "key": "6176a74d00de07982928928efdfa9412cdfbe9f635c86ef17dca58425ecd9559",
+   "salt": "4d70572190be5b294c262e3438e4f2e83b19832aa4f38446",
+   "ctx": "5aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+   "expected": {
+    "info": "50564c542d7631006f626a6563740000015aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+    "ek": "3c6202953dc08341b87467f09959c3770bb2ca632c501d3d0d5ddbf2ee4a8380",
+    "ck": "bc17ddd1b3051158b2553cbf8bbd51730bcf37d27695e6a0006dee7e54d19c7c",
+    "nonce_single": "4d70572190be5b294c262e3438e4f2e83b19832aa4f38446",
+    "nonce_chunk_0": "4d70572190be5b294c262e3438e4f2e83b19830000000000",
+    "nonce_chunk_7_last": "4d70572190be5b294c262e3438e4f2e83b19830000000701"
+   }
+  },
+  {
+   "name": "PVLT-XC20P-HS256 wrap",
+   "suite": 1,
+   "label": "wrap",
+   "key": "1cfa303073704580881c81349feb3da2bdeef24f5a33133d7a8f9b1328b3206b",
+   "salt": "009089fe17820a01022e394c84321918b84dab61aa0be13c",
+   "ctx": "0004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+   "expected": {
+    "info": "50564c542d763100777261700000010004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+    "ek": "3844acd407073987d774f9c089c374c80f16fec425b3addfe1c76ebc8be9dce2",
+    "ck": "6bc4fe891e2b59a6eaab02646e9c8085609a08ee282d9451dc17265d6ba7f19a",
+    "nonce_single": "009089fe17820a01022e394c84321918b84dab61aa0be13c",
+    "nonce_chunk_0": "009089fe17820a01022e394c84321918b84dab0000000000",
+    "nonce_chunk_7_last": "009089fe17820a01022e394c84321918b84dab0000000701"
+   }
+  },
+  {
+   "name": "PVLT-A256GCMSIV-HS256 object",
+   "suite": 2,
+   "label": "object",
+   "key": "6176a74d00de07982928928efdfa9412cdfbe9f635c86ef17dca58425ecd9559",
+   "salt": "38a519139986253ae953ac70067e7188daa26851dc04bf30",
+   "ctx": "5aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+   "expected": {
+    "info": "50564c542d7631006f626a6563740000025aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+    "ek": "b8716b650c4d2f9c78b04a717a81e896a7952e66df33348e6b2c3ecaa63a49ac",
+    "ck": "bb06371f371d149451a3ba99394fd742030ea2e509a79d8988f0dee688abe4a6",
+    "nonce_single": "38a519139986253ae953ac70",
+    "nonce_chunk_0": "38a519139986250000000000",
+    "nonce_chunk_7_last": "38a519139986250000000701"
+   }
+  },
+  {
+   "name": "PVLT-A256GCMSIV-HS256 wrap",
+   "suite": 2,
+   "label": "wrap",
+   "key": "1cfa303073704580881c81349feb3da2bdeef24f5a33133d7a8f9b1328b3206b",
+   "salt": "18ee8b75684ba3c986d6696cce1d738d4f23790cf89a4d14",
+   "ctx": "0004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+   "expected": {
+    "info": "50564c542d763100777261700000020004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+    "ek": "f0cf8e409039f55d5fbeda6892d13bfd851cd42946879db18316aa215033ef7a",
+    "ck": "12f7fff43d2972bb0a42c0f6eae0384e126749a6230ca9dc298460896d2e54e8",
+    "nonce_single": "18ee8b75684ba3c986d6696c",
+    "nonce_chunk_0": "18ee8b75684ba30000000000",
+    "nonce_chunk_7_last": "18ee8b75684ba30000000701"
+   }
+  },
+  {
+   "name": "PVLT-A256GCM-HS256 object",
+   "suite": 3,
+   "label": "object",
+   "key": "6176a74d00de07982928928efdfa9412cdfbe9f635c86ef17dca58425ecd9559",
+   "salt": "c87c4a677716ae3f7dff9e37889522de3322ddce089f4f64",
+   "ctx": "5aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+   "expected": {
+    "info": "50564c542d7631006f626a6563740000035aa405162fc9add2c34038d2b26e97dadf800fe5ee05fe68b8d6bbc32bdf99ce9f095c1396c3b20c7434675e8d932cd6",
+    "ek": "d59e62b7b851bae9beab88e46811cd797bc5af56b111282666b0f1a71965a581",
+    "ck": "f44c33cad320c54528ba63b94cfaf0947d87ce15889b7a6884f38ae419ef51d9",
+    "nonce_single": "c87c4a677716ae3f7dff9e37",
+    "nonce_chunk_0": "c87c4a677716ae0000000000",
+    "nonce_chunk_7_last": "c87c4a677716ae0000000701"
+   }
+  },
+  {
+   "name": "PVLT-A256GCM-HS256 wrap",
+   "suite": 3,
+   "label": "wrap",
+   "key": "1cfa303073704580881c81349feb3da2bdeef24f5a33133d7a8f9b1328b3206b",
+   "salt": "13c090bae6e15f1a67857189e729abeb1c25ae153ad52c3c",
+   "ctx": "0004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+   "expected": {
+    "info": "50564c542d763100777261700000030004726f6f740010b11df4a50e34807a38def6f020cefa47000400000001",
+    "ek": "7047d75f9cca999bc4be5152905e8c9ba8b848a6ec0fca8f33c50beeae0e5f36",
+    "ck": "9e0752c5a2ec3b0ecffe22a445b9dbb4e9fb4618f6724c4d6d1df858557c44f3",
+    "nonce_single": "13c090bae6e15f1a67857189",
+    "nonce_chunk_0": "13c090bae6e15f0000000000",
+    "nonce_chunk_7_last": "13c090bae6e15f0000000701"
+   }
+  }
+ ]
+}

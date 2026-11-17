@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/pvlt-format", "crates/pvlt-mem", "crates/pvlt-core", "crates/pvlt-store", "crates/pvlt-objects", "crates/pvlt-server", "crates/pvlt-tokens"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+keywords = ["pii", "encryption", "crypto-shredding", "privacy", "vault"]
+categories = ["cryptography"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+panic = "deny"
+todo = "deny"
+
+[profile.release]
+overflow-checks = true

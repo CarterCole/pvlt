@@ -1,0 +1,19 @@
+[package]
+name = "pvlt-tokens"
+description = "Biscuit request tokens for pvlt: verifying a delegated token and reading its claims"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories = ["cryptography", "authentication"]
+readme = "README.md"
+
+[dependencies]
+biscuit-auth = "6"
+hex = "0.4"
+time = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1"
+
+[lints]
+workspace = true

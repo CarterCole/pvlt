@@ -1,0 +1,32 @@
+[package]
+name = "pvlt-store"
+description = "The PostgreSQL key store for pvlt, with a schema that refuses malformed or resurrected rows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories = ["database", "cryptography"]
+readme = "README.md"
+
+[features]
+default = []
+# Lets the store read and write the passphrase seal mode. Never in a production build (docs/DECISIONS.md).
+dev-insecure = ["pvlt-core/dev-insecure"]
+
+[dependencies]
+pvlt-core = { path = "../pvlt-core", version = "0.1.0" }
+pvlt-format = { path = "../pvlt-format", version = "0.1.0" }
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "migrate", "macros", "uuid", "time", "json"] }
+
+[dev-dependencies]
+pvlt-mem = { path = "../pvlt-mem", version = "0.1.0" }
+time = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

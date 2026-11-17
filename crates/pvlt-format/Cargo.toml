@@ -1,0 +1,38 @@
+[package]
+name = "pvlt-format"
+description = "The pvlt v1 byte formats: sealed facts and blobs, wrapped keys, blind identifiers and signed logs. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories = ["cryptography::algorithms", "cryptography"]
+readme = "README.md"
+# The vectors live in the repository's spec/ directory, outside this crate, so this test cannot run from a package.
+exclude = ["tests/vectors.rs"]
+
+[features]
+default = []
+# Suite 0x0002 (AES-256-GCM-SIV). Optional in FORMAT.md section 2.
+gcm-siv = ["dep:aes-gcm-siv"]
+
+[dependencies]
+aes-gcm = "0.11"
+aes-gcm-siv = { version = "0.12", optional = true }
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3"
+hex = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+serde_json = "1"
+sha2 = "0.11"
+subtle = "2.6"
+unicode-normalization = "0.1"
+zeroize = "1.8"
+
+[dev-dependencies]
+proptest = "1"
+serde_json_canonicalizer = "0.4"
+
+[lints]
+workspace = true

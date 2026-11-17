@@ -1,0 +1,38 @@
+[package]
+name = "pvlt-core"
+description = "The pvlt engine: key hierarchy, Shamir seal and unseal, and the fact create, read and shred paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories = ["cryptography"]
+readme = "README.md"
+
+[features]
+default = []
+# Conveniences that must never be in a production build (docs/DECISIONS.md, "Staging versus production"):
+# sealing the root key with a passphrase instead of Shamir shares.
+dev-insecure = ["dep:argon2"]
+
+[dependencies]
+argon2 = { version = "0.6", optional = true }
+blahaj = "0.7"
+futures-channel = "0.3"
+getrandom = "0.4"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pvlt-format = { path = "../pvlt-format", version = "0.1.0" }
+pvlt-mem = { path = "../pvlt-mem", version = "0.1.0" }
+sha2 = "0.11"
+subtle = "2.6"
+time = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1"
+zeroize = "1.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

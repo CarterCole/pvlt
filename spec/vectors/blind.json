@@ -1,0 +1,42 @@
+{
+ "format": "pvlt-v1",
+ "description": "Blind identifiers (section 6)",
+ "vectors": [
+  {
+   "name": "subject 'user:1234'",
+   "fn": "subject_hmac",
+   "key": "70da7788ddc7d89a6650bfbf1c7d9d8e1a60d029a0af268fded58aceeb3c59da",
+   "input": "user:1234",
+   "expected": "4c647df8afe7cdcdfd4cda241e30d6690c39d7e768a0c7e35f9472c03a8a7bf6"
+  },
+  {
+   "name": "subject 'Zoë Example'",
+   "fn": "subject_hmac",
+   "key": "70da7788ddc7d89a6650bfbf1c7d9d8e1a60d029a0af268fded58aceeb3c59da",
+   "input": "Zoë Example",
+   "expected": "e35c6ba89ead966cfbcbe0359a206d6eb9960c01e5f6b136c88e89b3e05823b9"
+  },
+  {
+   "name": "scope",
+   "fn": "scope_hmac",
+   "key": "70da7788ddc7d89a6650bfbf1c7d9d8e1a60d029a0af268fded58aceeb3c59da",
+   "input": "kyc-doc:42",
+   "expected": "155db29b3bebc051405615fce3bbb5af6063a0cf0b113df0f6c45148b81da190"
+  },
+  {
+   "name": "pseudo-subject",
+   "fn": "pseudo_subject_hmac",
+   "key": "70da7788ddc7d89a6650bfbf1c7d9d8e1a60d029a0af268fded58aceeb3c59da",
+   "input": "kyc-doc:42",
+   "expected": "2fee9cb0b97687d70e92acd2562ce38dd9b5c5bc11a08049b181652394f11e7a"
+  },
+  {
+   "name": "index",
+   "fn": "index_value",
+   "key": "365dad9f7b72506592793eace3bc22ddfd9979725591357677d743f677725ded",
+   "index_name": "id-doc",
+   "input_hex": "70617373706f72743a5831323334353637",
+   "expected": "ddd19f33aff80bcdfcae6b982562fd37c72a02ef32a36d8122467ceafb82e671"
+  }
+ ]
+}
