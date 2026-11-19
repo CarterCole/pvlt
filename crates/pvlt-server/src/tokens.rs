@@ -28,11 +28,14 @@
 //! than `max_ttl` away is refused.
 
 use core::fmt;
+use core::time::Duration;
 
 use biscuit_auth::builder::{
     Algorithm, AuthorizerBuilder, BiscuitBuilder, BlockBuilder, Fact, Term,
 };
-use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey, RootKeyProvider, error};
+use biscuit_auth::{
+    AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, RootKeyProvider, error,
+};
 use uuid::Uuid;
 
 /// The longest token text accepted, before any parsing.
@@ -41,6 +44,31 @@ pub const MAX_TOKEN_LEN: usize = 8 * 1024;
 pub const MAX_CLAIM_LEN: usize = 256;
 /// The most values a repeatable claim may have.
 pub const MAX_REPEATS: usize = 32;
+
+// Run limits for a token's Datalog. Anyone holding a token can append a block of rules and checks, so these
+// are what stop a hostile block from making the vault work without end. A genuine token holds about a hundred
+// facts at most (ten single claims, three repeatable ones up to `MAX_REPEATS` each, and `time`) and needs one
+// round of rule evaluation, so the fact and round limits sit far above it.
+//
+// The time limit is wall-clock time, so it also counts time the thread spends waiting for a CPU. biscuit-auth's
+// default of 1 ms refused genuine tokens when the machine was busy: with 32 threads verifying a token that
+// carries every claim, about 1 in 8 were refused in a debug build. 50 ms tolerates that and still bounds a block
+// that keeps deriving facts round after round. biscuit-auth reads the clock only between rounds and between
+// check queries, so a single costly round or a check with a large join can run past it.
+/// The most facts a token's Datalog may hold before it is refused.
+pub const MAX_FACTS: u64 = 1000;
+/// The most rounds of rule evaluation a token may need before it is refused.
+pub const MAX_ITERATIONS: u64 = 100;
+/// The longest the token's rules and checks may run, together, before it is refused.
+pub const MAX_TIME: Duration = Duration::from_millis(50);
+
+fn run_limits() -> AuthorizerLimits {
+    AuthorizerLimits {
+        max_facts: MAX_FACTS,
+        max_iterations: MAX_ITERATIONS,
+        max_time: MAX_TIME,
+    }
+}
 
 /// Why a token was refused. It never carries the token or any claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,14 +171,31 @@ fn rfc3339(unix: i64) -> Result<String, TokenError> {
     ))
 }
 
+/// Reads one claim after `authorize`, from the authority block only (a query never sees later blocks' facts).
+///
+/// `Authorizer::query` charges each query to the time already spent in `authorize` and refuses once the total
+/// reaches `MAX_TIME`, so a dozen queries could run out the budget of a token that had already passed. Each claim
+/// query is a single pass of a one-predicate rule over facts that are already computed, with no rounds and no
+/// joins, so it is given limits of its own instead. (biscuit-auth 6.0 does not apply limits inside a query at
+/// all, and does not charge it against the earlier total.)
+fn claim_query<T>(
+    authorizer: &mut biscuit_auth::Authorizer,
+    rule: &str,
+) -> Result<Vec<T>, TokenError>
+where
+    T: TryFrom<Fact, Error = error::Token>,
+{
+    authorizer
+        .query_with_limits(rule, run_limits())
+        .map_err(|_| TokenError::Rejected)
+}
+
 fn strings(
     authorizer: &mut biscuit_auth::Authorizer,
     name: &'static str,
 ) -> Result<Vec<String>, TokenError> {
     let rule = format!("data($x) <- {name}($x)");
-    let found: Vec<(String,)> = authorizer
-        .query(rule.as_str())
-        .map_err(|_| TokenError::Rejected)?;
+    let found: Vec<(String,)> = claim_query(authorizer, &rule)?;
     let mut out: Vec<String> = found.into_iter().map(|(s,)| s).collect();
     out.sort();
     out.dedup();
@@ -190,14 +235,13 @@ pub fn verify(
     let mut authorizer = AuthorizerBuilder::new()
         .code(format!("time({});", rfc3339(now)?))
         .and_then(|b| b.policy("allow if true"))
+        .map(|b| b.set_limits(run_limits()))
         .and_then(|b| b.build(&biscuit))
         .map_err(|_| TokenError::Rejected)?;
-    // Runs the authority block's and every later block's checks.
+    // Runs the authority block's and every later block's rules and checks, all within `run_limits`.
     authorizer.authorize().map_err(|_| TokenError::Rejected)?;
 
-    let expires: Vec<(i64,)> = authorizer
-        .query("data($x) <- expires($x)")
-        .map_err(|_| TokenError::Rejected)?;
+    let expires: Vec<(i64,)> = claim_query(&mut authorizer, "data($x) <- expires($x)")?;
     let expires = match expires.as_slice() {
         [(e,)] => *e,
         [] => return Err(TokenError::Missing("expires")),
