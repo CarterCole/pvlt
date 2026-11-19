@@ -5,6 +5,9 @@
 //! * [`compat`]: the OPV-compatible `/api/v1/facts` routes OPV clients call.
 //! * [`v2`]: the native API, driven by delegated Biscuit tokens and the policy.
 //! * [`admin`]: sealing and unsealing, on a separate listener.
+//! * [`pg`]: the Postgres key store and its migrations.
+//! * [`bucket`]: the S3-compatible, directory or in-memory object store.
+//! * [`tokens`]: Biscuit token verification and minting.
 //! * [`tls`]: the listener. TLS 1.3 only; a plaintext listener exists only in a `dev-insecure` build.
 //!
 //! Two ways in: the deprecated `/api/v1` with one static token (a fixed principal, governed by the policy's
@@ -15,12 +18,15 @@ pub mod admin;
 pub mod app;
 pub mod backup;
 pub mod blobs;
+pub mod bucket;
 pub mod compat;
 pub mod config;
 pub mod error;
 pub mod import_opv;
+pub mod pg;
 pub mod routes;
 pub mod tls;
+pub mod tokens;
 pub mod tools;
 pub mod v2;
 

@@ -2704,16 +2704,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "pvlt-objects"
+name = "pvlt-policy"
 version = "0.1.0"
 dependencies = [
- "futures",
- "object_store",
- "pvlt-core",
  "pvlt-format",
- "pvlt-mem",
- "time",
- "tokio",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -2723,18 +2720,19 @@ dependencies = [
  "age",
  "axum",
  "base64 0.22.1",
+ "biscuit-auth",
+ "futures",
  "futures-util",
  "getrandom 0.4.3",
  "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "object_store",
  "pvlt-core",
  "pvlt-format",
  "pvlt-mem",
- "pvlt-objects",
- "pvlt-store",
- "pvlt-tokens",
+ "pvlt-policy",
  "rcgen",
  "reqwest",
  "rustls",
@@ -2751,30 +2749,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
-]
-
-[[package]]
-name = "pvlt-store"
-version = "0.1.0"
-dependencies = [
- "pvlt-core",
- "pvlt-format",
- "pvlt-mem",
- "serde_json",
- "sqlx",
- "time",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "pvlt-tokens"
-version = "0.1.0"
-dependencies = [
- "biscuit-auth",
- "hex",
- "time",
- "uuid",
 ]
 
 [[package]]

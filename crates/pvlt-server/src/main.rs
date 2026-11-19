@@ -11,12 +11,12 @@ use pvlt_core::objects::SplitStore;
 use pvlt_core::seal::init_shamir;
 use pvlt_core::store::{KeyStore, StoreError};
 use pvlt_mem::{Arena, LockPolicy, harden_process};
-use pvlt_objects::Bucket;
 use pvlt_server::app::{Admin, App, Token};
+use pvlt_server::bucket::Bucket;
 use pvlt_server::config::{Config, Env, Storage};
+use pvlt_server::pg::PgStore;
 use pvlt_server::tls::{Transport, load_tls, serve, stop_signal};
 use pvlt_server::{INSECURE_BUILD, admin, backup, routes, tools};
-use pvlt_store::PgStore;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
         Some("audit-verify") if args.len() == 1 => runtime.block_on(audit_verify_cmd()),
         Some("import-opv") => runtime.block_on(import_opv_cmd(rest)),
         Some("issuer-keygen") if args.len() == 1 => {
-            let (seed, public) = pvlt_tokens::generate_issuer_key();
+            let (seed, public) = pvlt_server::tokens::generate_issuer_key();
             println!("{}", hex::encode(seed));
             eprintln!(
                 "Private seed above (keep it with the issuing service only). Register this public key:\n{}",
@@ -171,7 +171,7 @@ fn mint_cmd(args: &[String]) -> Result<(), String> {
         first("--ttl").map_or(Ok(60), |v| v.parse().map_err(|_| "--ttl needs a number"))?;
     let mut request_id = [0u8; 8];
     getrandom::fill(&mut request_id).map_err(|_| "no random numbers")?;
-    let claims = pvlt_tokens::Claims {
+    let claims = pvlt_server::tokens::Claims {
         issuer_key_id: key_id,
         caller: first("--caller"),
         subject: first("--subject"),
@@ -189,7 +189,7 @@ fn mint_cmd(args: &[String]) -> Result<(), String> {
         approval: first("--approval"),
         expires: time::OffsetDateTime::now_utc().unix_timestamp() + ttl,
     };
-    let token = pvlt_tokens::mint(&seed, &claims).map_err(|e| e.to_string())?;
+    let token = pvlt_server::tokens::mint(&seed, &claims).map_err(|e| e.to_string())?;
     println!("{token}");
     Ok(())
 }

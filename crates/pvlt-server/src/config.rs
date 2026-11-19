@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::bucket::S3Config;
 use pvlt_format::Id;
-use pvlt_objects::S3Config;
 use uuid::Uuid;
 
 /// Where sealed values go.

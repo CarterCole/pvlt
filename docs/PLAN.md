@@ -44,8 +44,10 @@ taken there. Decision 3 is settled: the key store is Postgres only (see 3.6).
 
 ## 2. Workspace
 
-One Cargo workspace, six crates. The split follows review boundaries, not tidiness: the format crate and the
-unsafe crate are the two pieces an outside reviewer reads line by line.
+One Cargo workspace, five crates (collapsed from seven on 2026-11-19: the Postgres store, object store and token code
+are modules of `pvlt-server`, since nothing else uses them, and the policy language was split out of the core as
+pure logic). The split follows review boundaries, not tidiness: the format crate and the unsafe crate are the two
+pieces an outside reviewer reads line by line.
 
 ```
 pvlt/
@@ -55,10 +57,10 @@ pvlt/
 ├─ crates/
 │  ├─ pvlt-format/           FORMAT.md and nothing else. No I/O, no async, no clock.
 │  ├─ pvlt-mem/              the only crate with `unsafe`: locked key arena, process hardening
-│  ├─ pvlt-core/             engine: key hierarchy, traits, fact/blob/shred paths, logs, policy
-│  ├─ pvlt-store/            the Postgres key store and its migrations
-│  ├─ pvlt-server/           the `pvlt` binary: listeners, HTTP APIs, CLI subcommands
-│  └─ pvlt-client/           Rust SDK (uses pvlt-format for client-side blob encryption)
+│  ├─ pvlt-policy/           the policy language, evaluator and rate limiter: pure logic
+│  ├─ pvlt-core/             engine: key hierarchy, traits, fact/blob/shred paths, signed logs
+│  └─ pvlt-server/           the `pvlt` binary: listeners, HTTP APIs, CLI; modules `pg` (Postgres store and
+│                            migrations), `bucket` (object store), `tokens` (Biscuit)
 ├─ fuzz/                     cargo-fuzz targets
 └─ tests/                    end-to-end tests against Postgres and MinIO containers
 ```
@@ -67,10 +69,11 @@ pvlt/
 |---|---|---|
 | `pvlt-format` | suites, seal/open, object header, fact padding, Padmé, STREAM, wrapped keys, blind ids, log entries, canonical JSON, entry hashes, signatures | touch the network, disk, clock or an async runtime |
 | `pvlt-mem` | `KeyArena` (one `mmap`ed, `mlock`ed, no-dump region with guard pages, 32-byte slots), core-dump and ptrace disabling | know what the keys are for |
-| `pvlt-core` | `Vault` engine, `KeyStore` and `RootKeyProvider` traits, unseal, logs, policy evaluation, token verification, sweepers | know about HTTP |
-| `pvlt-store` | Postgres SQL, migrations, the linearizable-write guarantee | hold plaintext or unwrapped keys |
-| `pvlt-server` | axum routers, TLS, extractors, error mapping, config, CLI | contain crypto or policy logic |
-| `pvlt-client` | typed client for `/v2`, blob encrypt and decrypt | |
+| `pvlt-policy` | policy document, canonical form and hash, evaluator, rate limiter | hold keys or do I/O |
+| `pvlt-core` | `Engine`, `KeyStore` and `ObjectStore` traits, unseal, signed logs, sweepers | know about HTTP |
+| `pvlt-server` | axum routers, TLS, config, CLI; `pg` (Postgres SQL, migrations, the linearizable-write guarantee, which must not hold plaintext or unwrapped keys), `bucket`, `tokens` | contain crypto or policy logic |
+
+The typed clients are in `clients/` (Python and TypeScript), not a Rust crate.
 
 Every crate except `pvlt-mem` has `#![forbid(unsafe_code)]`. Workspace lints deny `clippy::unwrap_used`,
 `clippy::expect_used`, `clippy::indexing_slicing` and `clippy::dbg_macro` outside tests.

@@ -36,11 +36,9 @@ in [`REQUIREMENTS.md`](REQUIREMENTS.md).
 |---|---|
 | `crates/pvlt-format` | the format, and nothing else: no I/O, no clock, no async |
 | `crates/pvlt-mem` | locked key memory and process hardening (the only crate with `unsafe`) |
-| `crates/pvlt-core` | key hierarchy, seal/unseal, the engine, the store traits |
-| `crates/pvlt-store` | the Postgres key store and its migrations |
-| `crates/pvlt-objects` | the object store (S3-compatible, directory, memory) |
-| `crates/pvlt-tokens` | Biscuit token verification and minting |
-| `crates/pvlt-server` | the `pvlt` binary |
+| `crates/pvlt-core` | key hierarchy, seal/unseal, the engine, the signed logs, the store traits |
+| `crates/pvlt-policy` | the access policy language, evaluator and rate limiter (pure logic) |
+| `crates/pvlt-server` | the `pvlt` binary, with the Postgres store (`pg`), object store (`bucket`) and Biscuit tokens (`tokens`) as modules |
 | `clients/` | Python and TypeScript clients |
 | `spec/` | the Python reference implementation and the test vectors |
 | `scripts/` | `test-db.sh` (throwaway Postgres), `smoke.sh` (end-to-end run of the real binary), `fake_opv.py` (stand-in for the migration rehearsal) |

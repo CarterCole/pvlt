@@ -18,7 +18,7 @@ use pvlt_core::keys::{Dek, DomainKeys, KeyMaterial, RootKey, SubjectKey, Wrapped
 use pvlt_core::store::{FactId, KeyStore, NewFact, NewSubjectKey};
 use pvlt_format::Id;
 use pvlt_mem::{Arena, LockPolicy};
-use pvlt_store::PgStore;
+use pvlt_server::pg::PgStore;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;

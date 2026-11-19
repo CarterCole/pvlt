@@ -4,16 +4,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use crate::tokens::IssuerKeys;
 use pvlt_core::VaultError;
 use pvlt_core::audit::Auditor;
 use pvlt_core::engine::Engine;
-use pvlt_core::limits::RateLimiter;
 use pvlt_core::objects::ObjectStore;
-use pvlt_core::policy::Policy;
 use pvlt_core::seal::{SealConfig, SealMode, UnsealShare, unseal_with_shares};
 use pvlt_core::store::{IssuerRecord, KeyStore};
 use pvlt_format::Id;
-use pvlt_tokens::IssuerKeys;
+use pvlt_policy::limits::RateLimiter;
+use pvlt_policy::policy::Policy;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 

@@ -22,8 +22,8 @@ use pvlt_core::objects::{ObjectError, ObjectInfo, ObjectStore};
 use pvlt_core::seal::{SealConfig, UnsealShare, init_shamir, unseal_with_shares};
 use pvlt_core::store::{FactId, KeyStore, State};
 use pvlt_mem::{Arena, LockPolicy};
+use pvlt_server::pg::PgStore;
 use pvlt_server::{backup, tools};
-use pvlt_store::PgStore;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 const SECRET: &str = "Quentin-Q.-Nightingale-1987-03-09";

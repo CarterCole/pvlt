@@ -5,7 +5,7 @@
 //! subject or scope, or an unwrapped key. An implementation cannot be handed those, so it cannot leak them. The
 //! ciphertext of the values is in the object store, not here.
 //!
-//! The only implementation is Postgres (`pvlt-store`). The trait exists as the seam that engine unit tests fake.
+//! The only implementation is Postgres (`pvlt_server::pg`). The trait exists as the seam that engine unit tests fake.
 //! Every method returns a future that is `Send`, so an implementation can be called from any task.
 //!
 //! # What an implementation must guarantee

@@ -6,12 +6,12 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::pg::PgStore;
 use pvlt_core::audit::Auditor;
 use pvlt_core::engine::{Engine, ReconcileReport};
 use pvlt_core::ledger;
 use pvlt_core::objects::ObjectStore;
 use pvlt_core::store::KeyStore;
-use pvlt_store::PgStore;
 use zeroize::Zeroizing;
 
 use crate::backup::{self, BackupError};
@@ -96,7 +96,7 @@ pub async fn scrub_backup<O: ObjectStore, A: Auditor>(
 fn read_backup(
     input: &Path,
     identity_file: &Path,
-) -> Result<Vec<pvlt_store::TableDump>, BackupError> {
+) -> Result<Vec<crate::pg::TableDump>, BackupError> {
     let cipher = std::fs::read(input)
         .map_err(|e| err(format!("cannot read {}: {}", input.display(), e.kind())))?;
     let identity = read_secret_file(identity_file)?;

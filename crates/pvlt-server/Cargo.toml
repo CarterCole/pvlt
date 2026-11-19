@@ -1,12 +1,12 @@
 [package]
 name = "pvlt-server"
-description = "The pvlt server and command: TLS 1.3 listeners, an OPV-compatible API, and unseal and seal."
+description = "The pvlt server and command: TLS 1.3 listeners, the /v2 and OPV-compatible APIs, Postgres key store, S3 object store, Biscuit tokens, backups and migration."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
-categories = ["web-programming::http-server", "cryptography"]
+categories = ["web-programming::http-server", "cryptography", "database"]
 readme = "README.md"
 
 [[bin]]
@@ -18,11 +18,15 @@ default = []
 # Conveniences that must never be in a production build (docs/DECISIONS.md, "Staging versus production"): a
 # plaintext listener, a local-directory object store, tokens read from environment variables, and the
 # passphrase seal mode. Off by default; the release image never turns it on.
-dev-insecure = ["pvlt-core/dev-insecure", "pvlt-store/dev-insecure"]
+dev-insecure = ["pvlt-core/dev-insecure"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "json", "query"] }
 age = { version = "0.12", default-features = false }
+biscuit-auth = "6"
+futures = "0.3"
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "migrate", "macros", "uuid", "time", "json"] }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
@@ -33,9 +37,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 pvlt-core = { path = "../pvlt-core", version = "0.1.0" }
 pvlt-format = { path = "../pvlt-format", version = "0.1.0" }
 pvlt-mem = { path = "../pvlt-mem", version = "0.1.0" }
-pvlt-objects = { path = "../pvlt-objects", version = "0.1.0" }
-pvlt-store = { path = "../pvlt-store", version = "0.1.0" }
-pvlt-tokens = { path = "../pvlt-tokens", version = "0.1.0" }
+pvlt-policy = { path = "../pvlt-policy", version = "0.1.0" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 serde = { version = "1", features = ["derive"] }
@@ -52,7 +54,6 @@ zeroize = "1.8"
 time = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 

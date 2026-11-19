@@ -23,7 +23,7 @@ use pvlt_core::objects::ObjectStore;
 use pvlt_core::seal::{SealConfig, UnsealShare, init_shamir, unseal_with_shares};
 use pvlt_core::store::{FactId, KeyStore, LedgerAppend, ShredFact, ShredPlan, State, StoreError};
 use pvlt_mem::{Arena, LockPolicy};
-use pvlt_store::PgStore;
+use pvlt_server::pg::PgStore;
 
 const SECRET: &str = "Quentin-Q.-Nightingale-1987-03-09";
 const WHO: &str = "tester";

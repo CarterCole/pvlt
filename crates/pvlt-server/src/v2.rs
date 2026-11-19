@@ -1,6 +1,6 @@
 //! The native API, `/v2`, driven by delegated request tokens (REQUIREMENTS 3.7, 3.10).
 //!
-//! A trusted service mints a short-lived [Biscuit](pvlt_tokens) token per operation and sends it as
+//! A trusted service mints a short-lived [Biscuit](crate::tokens) token per operation and sends it as
 //! `Authorization: Bearer <token>`. For each request the vault
 //!
 //! 1. verifies the token against the issuer registry (signature, expiry, a lifetime no longer than the
@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::tokens::Claims;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
@@ -31,11 +32,10 @@ use pvlt_core::audit::{Action as AuditAction, Auditor};
 use pvlt_core::audit_log::{Caller, Kind};
 use pvlt_core::engine::CreateFact;
 use pvlt_core::ledger::Reason;
-use pvlt_core::limits::Verdict;
 use pvlt_core::objects::ObjectStore;
-use pvlt_core::policy::{Action, Allowed, Context, Decision, Request};
 use pvlt_core::store::{FactId, KeyStore, State as FactState};
-use pvlt_tokens::Claims;
+use pvlt_policy::limits::Verdict;
+use pvlt_policy::policy::{Action, Allowed, Context, Decision, Request};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -151,7 +151,7 @@ pub(crate) async fn authenticate<K: KeyStore, O: ObjectStore, A: Auditor>(
         .ok_or(ApiError::Unauthorized)?;
     let access = app.access();
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let claims = match pvlt_tokens::verify(token, access.as_ref(), now, app.max_token_ttl) {
+    let claims = match crate::tokens::verify(token, access.as_ref(), now, app.max_token_ttl) {
         Ok(c) => c,
         Err(e) => {
             // Why a token failed is for the operator, not the caller.

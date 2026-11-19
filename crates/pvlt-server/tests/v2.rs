@@ -22,8 +22,8 @@ use pvlt_core::seal::init_shamir;
 use pvlt_core::store::KeyStore;
 use pvlt_mem::{Arena, LockPolicy};
 use pvlt_server::app::{Admin, App, Token};
+use pvlt_server::tokens::{Claims, generate_issuer_key, mint};
 use pvlt_server::{admin, routes};
-use pvlt_tokens::{Claims, generate_issuer_key, mint};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -321,7 +321,7 @@ async fn attenuation_narrows_a_token_and_cannot_add_a_role() {
     let base = token(&r, &verifier());
     let keys = r.app.access();
     // Shortened: fine until it runs out.
-    let shorter = pvlt_tokens::attenuate_expiry(&base, keys.as_ref(), now() + 30).unwrap();
+    let shorter = pvlt_server::tokens::attenuate_expiry(&base, keys.as_ref(), now() + 30).unwrap();
     assert_eq!(
         call(
             &r.data,
@@ -334,7 +334,7 @@ async fn attenuation_narrows_a_token_and_cannot_add_a_role() {
         .0,
         StatusCode::OK
     );
-    let spent = pvlt_tokens::attenuate_expiry(&base, keys.as_ref(), now() - 1).unwrap();
+    let spent = pvlt_server::tokens::attenuate_expiry(&base, keys.as_ref(), now() - 1).unwrap();
     assert_eq!(
         call(
             &r.data,
@@ -349,7 +349,7 @@ async fn attenuation_narrows_a_token_and_cannot_add_a_role() {
     );
     // A holder who adds a role in a later block gains nothing.
     let plain = token(&r, &claims(&["data-subject"]));
-    let sneaky = pvlt_tokens::attenuate_with_fact(
+    let sneaky = pvlt_server::tokens::attenuate_with_fact(
         &plain,
         keys.as_ref(),
         "role(\"verifier\"); purpose(\"kyc-review\"); reason(\"x\");",

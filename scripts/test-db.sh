@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# A throwaway Postgres for the pvlt-store tests. Loopback only, data in memory, gone when stopped.
+# A throwaway Postgres for the pvlt-server Postgres tests. Loopback only, data in memory, gone when stopped.
 #
 #   scripts/test-db.sh start    start it (uses a local image; pulls nothing unless the image is missing)
 #   scripts/test-db.sh url      print the connection URL
 #   scripts/test-db.sh stop     remove it
 #
-# Then:  PVLT_TEST_DATABASE_URL=$(scripts/test-db.sh url) cargo test -p pvlt-store -- --include-ignored
+# Then:  PVLT_TEST_DATABASE_URL=$(scripts/test-db.sh url) cargo test -p pvlt-server -- --include-ignored
 #
 # Defaults to PostgreSQL 17. Set PVLT_TEST_PG_IMAGE (for example postgres:18-alpine or postgres:15-alpine) to test
 # another major version.

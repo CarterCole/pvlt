@@ -9,7 +9,7 @@ use pvlt_core::store::StoreError;
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::PgStore;
+use super::PgStore;
 
 /// The tables in a backup, in the order they must be loaded (parents before children).
 pub const BACKUP_TABLES: [&str; 10] = [

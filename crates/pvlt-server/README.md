@@ -1,6 +1,6 @@
 # pvlt-server
 
-The pvlt server and command: TLS 1.3 listeners, an OPV-compatible API, and unseal and seal.
+The pvlt server and command: TLS 1.3 listeners, the `/v2` and OPV-compatible APIs, a Postgres key store, an S3-compatible object store, Biscuit tokens, backups and migration.
 
 Part of [pvlt](../../README.md), a PII vault that erases by destroying keys.
 

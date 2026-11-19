@@ -30,9 +30,9 @@ use pvlt_core::VaultError;
 use pvlt_core::audit::{Action as AuditAction, Auditor};
 use pvlt_core::engine::CreateBlob;
 use pvlt_core::objects::ObjectStore;
-use pvlt_core::policy::Action;
 use pvlt_core::store::KeyStore;
 use pvlt_format::blob;
+use pvlt_policy::policy::Action;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -241,7 +241,7 @@ async fn gate<K, O, A>(
     id: &str,
     action: Action,
     audit_action: AuditAction,
-) -> Result<(crate::v2::Authn, Uuid, pvlt_core::policy::Allowed), ApiError>
+) -> Result<(crate::v2::Authn, Uuid, pvlt_policy::policy::Allowed), ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,

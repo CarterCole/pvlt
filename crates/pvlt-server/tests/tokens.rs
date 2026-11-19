@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use biscuit_auth::builder::Algorithm;
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey};
-use pvlt_tokens::{
+use pvlt_server::tokens::{
     Claims, IssuerKeys, TokenError, attenuate_expiry, attenuate_with_fact, generate_issuer_key,
     mint, public_key_of, verify,
 };

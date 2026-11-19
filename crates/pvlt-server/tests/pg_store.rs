@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! scripts/test-db.sh start
-//! PVLT_TEST_DATABASE_URL=$(scripts/test-db.sh url) cargo test -p pvlt-store -- --include-ignored
+//! PVLT_TEST_DATABASE_URL=$(scripts/test-db.sh url) cargo test -p pvlt-server -- --include-ignored
 //! ```
 
 #![allow(

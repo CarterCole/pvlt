@@ -7,7 +7,9 @@
     clippy::panic
 )]
 
-use pvlt_core::policy::{Action, Allowed, Context, Decision, Denial, Policy, Request, RoleLimits};
+use pvlt_policy::policy::{
+    Action, Allowed, Context, Decision, Denial, Policy, Request, RoleLimits,
+};
 
 const POLICY: &str = r#"{
   "version": 1,

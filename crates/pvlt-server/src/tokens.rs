@@ -3,7 +3,7 @@
 //!
 //! This crate only answers "is this token genuine, unexpired and signed by a key I was given, and what does it
 //! claim?". **It decides nothing about permission.** What a claim is allowed to mean is the policy's job
-//! (`pvlt_core::policy`), which does not trust a claim just because it is signed.
+//! (`pvlt_policy::policy`), which does not trust a claim just because it is signed.
 //!
 //! # Claims
 //!

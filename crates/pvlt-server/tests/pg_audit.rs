@@ -22,7 +22,7 @@ use pvlt_core::objects::ObjectStore;
 use pvlt_core::seal::{SealConfig, UnsealShare, init_shamir, unseal_with_shares};
 use pvlt_core::store::{AuditAppend, AuditFilter, FactId, KeyStore, StoreError};
 use pvlt_mem::{Arena, LockPolicy};
-use pvlt_store::PgStore;
+use pvlt_server::pg::PgStore;
 use time::OffsetDateTime;
 
 const DOMAIN: [u8; 16] = [7; 16];

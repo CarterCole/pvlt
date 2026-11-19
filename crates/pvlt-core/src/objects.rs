@@ -2,7 +2,7 @@
 //!
 //! Everything in a bucket is ciphertext under a random id, so the bucket reveals nothing the key store does not
 //! already, and an implementation never needs a key. The trait is the seam the engine is tested through; the
-//! real implementation is in `pvlt-objects`, and [`crate::memory::MemObjectStore`] is the in-process one.
+//! real implementation is in `pvlt_server::bucket`, and [`crate::memory::MemObjectStore`] is the in-process one.
 
 use core::fmt;
 use core::future::Future;

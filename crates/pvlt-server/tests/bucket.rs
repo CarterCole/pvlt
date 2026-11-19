@@ -16,7 +16,7 @@ use pvlt_core::memory::MemKeyStore;
 use pvlt_core::objects::{ObjectKey, ObjectStore};
 use pvlt_core::seal::init_shamir;
 use pvlt_mem::{Arena, LockPolicy};
-use pvlt_objects::{Bucket, S3Config};
+use pvlt_server::bucket::{Bucket, S3Config};
 
 fn key(domain: u8, object: u8) -> ObjectKey {
     ObjectKey {

@@ -1,6 +1,6 @@
 //! Key-store backups: framing, integrity, and `age` encryption.
 //!
-//! A backup is the key store exported as JSON lines (see `pvlt_store::PgStore::export_all`), closed with a line
+//! A backup is the key store exported as JSON lines (see `crate::pg::PgStore::export_all`), closed with a line
 //! that holds the SHA-256 of everything before it, and encrypted with `age`. The file on disk is never
 //! plaintext: it holds wrapped keys and the access history, which are not secret enough to be keys but are not
 //! something to leave in a bucket in the clear (REQUIREMENTS 3.6.4, threat T3).
@@ -14,7 +14,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::str::FromStr;
 
-use pvlt_store::{BACKUP_TABLES, TableDump};
+use crate::pg::{BACKUP_TABLES, TableDump};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
