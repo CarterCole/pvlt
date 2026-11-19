@@ -272,12 +272,15 @@ Python client. It removes both containers.
 
 ## What is not done
 
-* **Production gates** (DECISIONS.md): the Linux paths of `pvlt-mem` (locked memory, core dumps) have only been
-  compiled, never run; there is no independent cryptography review; the format is not frozen; WAL archiving and
+* **Production gates** (DECISIONS.md): the Linux paths of `pvlt-mem` (locked memory, core dumps) have run only in
+  an amd64 image under emulation on Apple Silicon (`/readyz` reported all three protections true), not yet on
+  real x86_64 hardware; there is no independent cryptography review; the format is not frozen; WAL archiving and
   volume encryption under Postgres are operations work.
-* The `Dockerfile` builds (the default feature set, distroless, non-root), and a tagged release pushes it to
-  `ghcr.io/<owner>/pvlt`. `compose.yaml` is an example only and has never been run end to end; the image has never run
-  in a real deployment. CI and the release workflow have never run on GitHub.
+* CI and the release workflow run on GitHub; a tagged release pushes the image to `ghcr.io/cartercole/pvlt` (public,
+  amd64 only) and the crates to crates.io. The image has been smoke-tested from a compose stack and from a
+  downstream deployment's compose project, with fake data; it has not run in a real production deployment.
+  `compose.yaml` is an example only: create the `pvlt` bucket first and set `PVLT_COMPAT_TOKEN_FILE` if you use
+  `/api/v1`.
 * No KMS root-key provider (Shamir only), no certificate reload, no per-statement database timeouts, no separate
   database role for migrations.
 * `pvlt unseal` and `pvlt seal` are HTTP calls, not commands.
