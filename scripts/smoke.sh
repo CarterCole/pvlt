@@ -240,8 +240,13 @@ check "the rerun skips the five done and imports the one that failed" bash -c "e
 FIRST_ID="$(sed -n 1p "$WORK/opv-ids.txt")"
 check "an imported fact is readable under its original id through the compat route" eq "$("${CURL[@]}" "${H[@]}" "$D/api/v1/facts/$FIRST_ID" | json "['value']")" "Quentin Q. Nightingale"
 check "a unicode value survives" eq "$("${CURL[@]}" "${H[@]}" "$D/api/v1/facts/$(sed -n 6p "$WORK/opv-ids.txt")" | json "['value']")" "plain-ascii-six"
+grep -v 5c0de999 "$WORK/opv.csv" > "$WORK/verify.csv"   # the row OPV never had
+VERIFY=(python3 "$ROOT/scripts/verify_opv_import.py" --csv "$WORK/verify.csv" --opv-url "http://127.0.0.1:$OPV_PORT" \
+  --opv-token-file "$WORK/opv-token" --vault-url "$D" --vault-token-file "$WORK/compat-token" --cacert "$WORK/cert.pem")
+check "the independent verifier agrees with the importer" bash -c "'${VERIFY[0]}' ${VERIFY[*]:1} | grep -qx 'checked 6  ok 6  problems 0'"
 check "the imported facts are filed under their subjects (a subject shred reaches one)" eq "$("${CURL[@]}" -X POST "${AH[@]}" "$A/v2/admin/shred/subject" -d '{"subject":"user:1","reason":"migration"}' | json "['outcome']")" shredded
 check "and that one is then gone" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${H[@]}" "$D/api/v1/facts/$FIRST_ID")" 410
+check "the verifier then fails, naming the shredded fact" bash -c "! '${VERIFY[0]}' ${VERIFY[*]:1} > '$WORK/verify.out' && grep -qx 'vault $FIRST_ID: 410' '$WORK/verify.out'"
 kill "$OPV_PID" 2>/dev/null || true
 wait "$OPV_PID" 2>/dev/null || true
 check "the Python client does the three OPV calls against the real server" env PVLT_TEST_URL="$D" PVLT_TEST_COMPAT_TOKEN="$COMPAT_TOKEN" PVLT_CA_BUNDLE="$WORK/cert.pem" python3 -m unittest discover -s "$ROOT/clients/python" -p 'test_pvlt_client.py'
