@@ -43,6 +43,13 @@ jobs:
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} does not match version $v"; exit 1; }
-      - run: cargo publish --workspace --locked
+      - name: skip when this version is already on crates.io
+        id: published
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A "pvlt-release" "https://crates.io/api/v1/crates/pvlt-server/$v")
+          echo "already=$([ "$code" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.published.outputs.already != 'true'
+        run: cargo publish --workspace --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
