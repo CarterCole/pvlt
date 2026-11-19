@@ -528,7 +528,8 @@ async fn run() -> Result<(), String> {
                 .collect(),
         )
         .with_access_limits(config.max_token_ttl, config.break_glass)
-        .with_blob_limits(config.max_blob_bytes, config.presign_ttl),
+        .with_blob_limits(config.max_blob_bytes, config.presign_ttl)
+        .with_gdpr(config.gdpr),
     );
     app.reload_access()
         .await
@@ -545,6 +546,13 @@ async fn run() -> Result<(), String> {
     }
     if app.compat_token.is_none() {
         tracing::warn!("no compat token is set, so /api/v1 refuses every request");
+    }
+    if app.gdpr.enabled {
+        tracing::info!(
+            export = app.gdpr.export_enabled(),
+            admin_inventory = app.gdpr.admin_inventory_enabled(),
+            "GDPR mode is on"
+        );
     }
 
     let (stop_tx, stop_rx) = watch::channel(false);

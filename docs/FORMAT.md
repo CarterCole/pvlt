@@ -293,6 +293,7 @@ Audit entry types. Every audit body has the same fields; a field that does not a
 | `create`, `shred`, `rebind` | with the operation |
 | `deny` | when policy refuses a request |
 | `admin` | for every admin-listener action |
+| `inventory` | before a subject's fact list (ids, types, dates, no values) is released by the GDPR routes; the list is not sent until this entry is durable |
 
 ```
 body = {"principal": string, "caller": string|null, "roles": [string], "purpose": string|null,

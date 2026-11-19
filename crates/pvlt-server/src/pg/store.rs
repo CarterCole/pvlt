@@ -8,7 +8,7 @@ use pvlt_core::store::{
     ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed, DomainRecord,
     DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore, LedgerAppend,
     LedgerHead, LedgerRecord, NewApproval, NewFact, NewSubjectKey, PolicyRecord, ReplayEffect,
-    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectKeyRecord,
+    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectFact, SubjectKeyRecord,
 };
 use pvlt_format::Id;
 use pvlt_format::wrap::SignPurpose;
@@ -1184,6 +1184,53 @@ impl KeyStore for PgStore {
                 get::<FactId>(r, "fact_id")?,
                 fixed(get(r, "object_id")?, "object id length")?,
             ))
+        })
+        .collect()
+    }
+
+    async fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject_hmac: &[u8; 32],
+        limit: u32,
+    ) -> Result<Vec<SubjectFact>, StoreError> {
+        // One statement, so the fact, subject key and domain states come from one snapshot.
+        sqlx::query(
+            "SELECT f.fact_id, f.fact_type, f.kind, f.created_at, f.expires_at, f.legal_hold, f.shredded_at, \
+               (f.state = 'shredded' OR s.state IS DISTINCT FROM 'active' OR d.state = 'shredded') AS gone \
+             FROM facts f \
+             JOIN domains d ON d.domain_id = f.domain_id \
+             LEFT JOIN subject_keys s ON s.domain_id = f.domain_id AND s.subject_hmac = f.subject_hmac \
+                                     AND s.version = f.subject_key_version \
+             WHERE f.domain_id = $1 AND f.subject_hmac = $2 \
+             ORDER BY f.created_at, f.fact_id LIMIT $3",
+        )
+        .bind(domain_id.as_slice())
+        .bind(subject_hmac.as_slice())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?
+        .iter()
+        .map(|r| {
+            Ok(SubjectFact {
+                fact_id: get(r, "fact_id")?,
+                fact_type: get(r, "fact_type")?,
+                kind: match get::<String>(r, "kind")?.as_str() {
+                    "fact" => FactKind::Fact,
+                    "blob" => FactKind::Blob,
+                    _ => return Err(StoreError::Corrupt("unknown fact kind")),
+                },
+                state: if get::<bool>(r, "gone")? {
+                    State::Shredded
+                } else {
+                    State::Active
+                },
+                created_at: get(r, "created_at")?,
+                expires_at: get(r, "expires_at")?,
+                legal_hold: get(r, "legal_hold")?,
+                shredded_at: get(r, "shredded_at")?,
+            })
         })
         .collect()
     }

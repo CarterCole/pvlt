@@ -77,6 +77,43 @@ impl IssuerKeys for Access {
     }
 }
 
+/// GDPR mode (`PVLT_GDPR_MODE`): routes that answer a data subject's rights of access and portability (art. 15,
+/// art. 20). Erasure (art. 17) is always available as a subject shred. Off by default. The parts that disclose
+/// more than a normal read can each be turned off on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GdprMode {
+    /// Whether the GDPR routes are served at all.
+    pub enabled: bool,
+    /// `POST /v2/subject/export`: every readable value of one subject in a single response
+    /// (`PVLT_GDPR_EXPORT`, default on). A stolen self token then gets everything at once, not one fact at a
+    /// time, so a deployment that answers portability requests some other way can turn it off.
+    pub export: bool,
+    /// `POST /v2/admin/subject/facts`: lets an admin list a subject's facts, without values
+    /// (`PVLT_GDPR_ADMIN_INVENTORY`, default on). An admin otherwise cannot tell which facts belong to whom.
+    pub admin_inventory: bool,
+}
+
+impl GdprMode {
+    /// Everything on.
+    pub fn on() -> Self {
+        Self {
+            enabled: true,
+            export: true,
+            admin_inventory: true,
+        }
+    }
+
+    /// Whether the export route is served.
+    pub fn export_enabled(&self) -> bool {
+        self.enabled && self.export
+    }
+
+    /// Whether the admin inventory route is served.
+    pub fn admin_inventory_enabled(&self) -> bool {
+        self.enabled && self.admin_inventory
+    }
+}
+
 /// Where unsealing stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsealStatus {
@@ -110,6 +147,8 @@ pub struct App<K, O, A> {
     pub max_blob_bytes: u64,
     /// How long a presigned upload or download address lives.
     pub presign_ttl: std::time::Duration,
+    /// Which GDPR routes are served.
+    pub gdpr: GdprMode,
     access: RwLock<Arc<Access>>,
     shares: Mutex<Vec<UnsealShare>>,
     domain_ready: AtomicBool,
@@ -142,6 +181,7 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
             limiter: RateLimiter::default(),
             max_blob_bytes: pvlt_core::engine::DEFAULT_MAX_BLOB_LEN,
             presign_ttl: std::time::Duration::from_secs(900),
+            gdpr: GdprMode::default(),
             access: RwLock::new(Arc::new(Access::default())),
             shares: Mutex::new(Vec::new()),
             domain_ready: AtomicBool::new(false),
@@ -169,6 +209,12 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
     ) -> Self {
         self.max_blob_bytes = max_blob_bytes;
         self.presign_ttl = presign_ttl;
+        self
+    }
+
+    /// Sets which GDPR routes are served. Routers built after this see it.
+    pub fn with_gdpr(mut self, gdpr: GdprMode) -> Self {
+        self.gdpr = gdpr;
         self
     }
 

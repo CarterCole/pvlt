@@ -19,7 +19,7 @@ use crate::store::{
     ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed, DomainRecord,
     DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore, LedgerAppend,
     LedgerHead, LedgerRecord, NewApproval, NewFact, NewSubjectKey, PolicyRecord, ReplayEffect,
-    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectKeyRecord,
+    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectFact, SubjectKeyRecord,
 };
 use uuid::Uuid;
 
@@ -1007,6 +1007,50 @@ impl KeyStore for MemKeyStore {
             .map(|f| (f.fact.fact_id, f.fact.object_id))
             .collect();
         v.sort();
+        Ok(v)
+    }
+
+    async fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject_hmac: &[u8; 32],
+        limit: u32,
+    ) -> Result<Vec<SubjectFact>, StoreError> {
+        let s = lock(&self.state);
+        let domain_shredded = s
+            .domains
+            .get(domain_id)
+            .is_some_and(|d| d.state == State::Shredded);
+        let keys = s.subjects.get(&(*domain_id, *subject_hmac));
+        let mut v: Vec<SubjectFact> = s
+            .facts
+            .values()
+            .filter(|f| f.fact.domain_id == *domain_id && f.fact.subject_hmac == *subject_hmac)
+            .map(|f| {
+                let key_shredded = keys
+                    .and_then(|ks| {
+                        ks.iter()
+                            .find(|k| k.key.version == f.fact.dek.subject_key_version)
+                    })
+                    .is_none_or(|k| k.state == State::Shredded);
+                SubjectFact {
+                    fact_id: f.fact.fact_id,
+                    fact_type: f.fact.fact_type.clone(),
+                    kind: f.kind,
+                    state: if domain_shredded || key_shredded || f.state == State::Shredded {
+                        State::Shredded
+                    } else {
+                        State::Active
+                    },
+                    created_at: f.created_at,
+                    expires_at: f.fact.expires_at,
+                    legal_hold: f.fact.legal_hold,
+                    shredded_at: f.shredded_at,
+                }
+            })
+            .collect();
+        v.sort_by_key(|f| (f.created_at, f.fact_id));
+        v.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(v)
     }
 

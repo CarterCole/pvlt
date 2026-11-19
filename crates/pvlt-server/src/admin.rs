@@ -36,6 +36,7 @@ where
     O: ObjectStore + 'static,
     A: Auditor + 'static,
 {
+    let gdpr = crate::gdpr::admin_router(Arc::clone(&app));
     Router::new()
         .route("/v2/sys/status", get(status::<K, O, A>))
         .route("/v2/sys/unseal", post(unseal::<K, O, A>))
@@ -70,6 +71,7 @@ where
         .route("/v2/admin/approvals", post(request_approval::<K, O, A>))
         .route("/v2/admin/approvals/{id}/approve", post(approve::<K, O, A>))
         .with_state(app)
+        .merge(gdpr)
 }
 
 #[derive(Serialize)]
@@ -133,7 +135,7 @@ where
 }
 
 /// Authenticates an admin credential and returns the admin's name.
-fn require_admin<'a, K: KeyStore, O: ObjectStore, A: Auditor>(
+pub(crate) fn require_admin<'a, K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &'a App<K, O, A>,
     headers: &HeaderMap,
 ) -> Result<&'a str, ApiError> {
@@ -162,7 +164,7 @@ fn reason_of(code: Option<&str>) -> Result<Reason, ApiError> {
     })
 }
 
-fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     // By hand, so a malformed body is a fixed message and never an echo of what was sent.
     serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("malformed request body"))
 }

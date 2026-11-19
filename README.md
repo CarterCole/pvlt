@@ -18,6 +18,8 @@ Open Privacy Vault (OPV), and serves an OPV-compatible subset of
 - A Postgres key store whose schema refuses malformed or resurrected rows.
 - Crypto-shredding of a fact, subject, scope or domain, recorded in a signed, hash-chained **ledger** that is replayed
   after a restore, so erased data stays erased. Expiry, retention and legal hold.
+- An optional **GDPR mode** (`PVLT_GDPR_MODE`): a data subject can list and export what the vault holds about
+  them, with the parts that disclose more than a normal read switchable off ([`docs/RUNNING.md`](docs/RUNNING.md#gdpr-mode)).
 - A signed, hash-chained **audit log**, written before every disclosure; reads fail closed; rollback detection.
 - Delegated Biscuit tokens, a registry of issuers, a default-deny JSON policy, dual control for restricted data,
   rate limits, and separate admin and data listeners.

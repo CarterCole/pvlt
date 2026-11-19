@@ -32,6 +32,8 @@ All from the environment. A secret is a file named by `NAME_FILE`; a default bui
 | `PVLT_ADMIN_TOKENS_FILE` | named admins, one `name:token` per line (tokens at least 16 characters, names and tokens unique). **Dual control needs two.** |
 | `PVLT_ADMIN_TOKEN_FILE` | a single admin named `admin`, for simple setups |
 | `PVLT_BREAK_GLASS=true` | lets one admin approve their own emergency read, for at most five minutes. Off by default. |
+| `PVLT_GDPR_MODE=true` | serves the data-subject access and export routes (see "GDPR mode" below). Off by default. |
+| `PVLT_GDPR_EXPORT` (`true`), `PVLT_GDPR_ADMIN_INVENTORY` (`true`) | with GDPR mode on, set either to `false` to drop that route |
 | `PVLT_MAX_TOKEN_TTL_SECS` (300) | the longest a request token may live; a longer one is refused even if genuine |
 | `PVLT_MAX_VALUE_BYTES` (1 MiB), `PVLT_MAX_BLOB_BYTES` (256 MiB) | limits |
 | `PVLT_PRESIGN_TTL_SECS` (900) | how long a presigned upload or download address lives |
@@ -139,6 +141,44 @@ has but cannot be verified, a fork, or a published entry that went missing stops
 
 What it does not protect against: copies of the *data bucket's* ciphertext are harmless (the keys are gone), but a
 copy of the key store from before a shred still holds the key until it is replayed or scrubbed.
+
+## GDPR mode
+
+`PVLT_GDPR_MODE=true` adds what the vault needs to answer a data subject's requests. Erasure is not part of the
+switch, because it is always there: a subject shred is crypto-shredding and the ledger makes it stick.
+
+| Right | How | Notes |
+|---|---|---|
+| Erasure (art. 17) | `POST /v2/shred/subject {"subject": ...}` with the subject's own token, or `POST /v2/admin/shred/subject` with `"reason": "subject_request"` | Always available. The subject's token needs a `self` shred rule over `*`. One key is destroyed however many facts there are, the ledger entry survives restores, and a shredded subject is not reopened by later writes. |
+| Access (art. 15) | `POST /v2/subject/facts {"subject": ...}` | Lists every fact under the subject: id, type, fact or blob, created, expiry, legal hold, active or shredded. **No values.** |
+| Access and portability (art. 15(3), 20) | `POST /v2/subject/export {"subject": ...}` | The list plus every value the token may read, as JSON. |
+| Who saw my data | `GET /v2/admin/audit?subject=...` | Unchanged; it was already the subject's access report. |
+| Admin inventory | `POST /v2/admin/subject/facts {"subject": ...}` on the admin listener | The list, **no values**, for staff answering a request. |
+
+The subject goes in the body, not the URL, so it is not in access logs. Each list is written to the audit log as
+an `inventory` entry before it is sent, and each exported value is an ordinary `read.grant`; if the audit log
+cannot be written, nothing is sent.
+
+Authorization is the policy's. Listing needs a `read` rule over every type (`*`), which a data subject normally
+has as `{"types": ["*"], "actions": ["read"], "when": ["self"]}`. The export then authorizes each fact as a normal
+read, so per-type rules, purposes and rate limits all apply. A fact the policy will not release is listed as
+`withheld` with the refusal code, and a restricted type is always withheld (its dual-control approval covers one
+fact, so release it through the normal read). A blob is listed with status `blob`: fetch it through the blob
+routes. A rate limit stops the whole export with 429 rather than returning a partial one that looks complete.
+
+**What to turn off if it is too much:**
+
+- `PVLT_GDPR_EXPORT=false` drops the export. A stolen self token can otherwise take everything about that one
+  person in a single request instead of one fact at a time. Turn it off if you answer portability requests
+  another way, or keep it and set a `read_per_hour` limit on the data-subject role.
+- `PVLT_GDPR_ADMIN_INVENTORY=false` drops the admin inventory. With it, an admin can see which facts (types,
+  dates) exist for a named person, which they otherwise cannot. Values stay out of reach either way: there is
+  deliberately no admin export.
+
+What GDPR mode does not do: it does not decide your lawful basis, retention periods or response deadlines; it has
+no "restrict processing" (art. 18) state yet (a legal hold is the nearest thing, and it blocks shredding, not
+reading); and audit entries keep the subject's blinded identifier after erasure, which is pseudonymous, not
+anonymous, for as long as the domain's blind-index key exists.
 
 ## The audit log
 

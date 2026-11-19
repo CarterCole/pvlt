@@ -5,6 +5,7 @@
 //! * [`compat`]: the OPV-compatible `/api/v1/facts` routes OPV clients call.
 //! * [`v2`]: the native API, driven by delegated Biscuit tokens and the policy.
 //! * [`admin`]: sealing and unsealing, on a separate listener.
+//! * [`gdpr`]: GDPR mode, the data-subject access and export routes (off unless `PVLT_GDPR_MODE` is set).
 //! * [`pg`]: the Postgres key store and its migrations.
 //! * [`bucket`]: the S3-compatible, directory or in-memory object store.
 //! * [`tokens`]: Biscuit token verification and minting.
@@ -22,6 +23,7 @@ pub mod bucket;
 pub mod compat;
 pub mod config;
 pub mod error;
+pub mod gdpr;
 pub mod import_opv;
 pub mod pg;
 pub mod routes;

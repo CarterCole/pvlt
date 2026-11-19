@@ -287,6 +287,27 @@ pub struct DueFact {
     pub object_id: Id,
 }
 
+/// A fact filed under a subject, as listed for a data-subject access request. Holds no key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectFact {
+    /// The fact id.
+    pub fact_id: FactId,
+    /// The fact type.
+    pub fact_type: String,
+    /// A fact or a blob.
+    pub kind: FactKind,
+    /// Shredded if the fact, the subject key that wraps it, or the domain was shredded.
+    pub state: State,
+    /// When it was created.
+    pub created_at: OffsetDateTime,
+    /// When it expires, if it does.
+    pub expires_at: Option<OffsetDateTime>,
+    /// Whether it is under legal hold.
+    pub legal_hold: bool,
+    /// When the fact row itself was shredded. A fact destroyed by a subject or domain shred has no time here.
+    pub shredded_at: Option<OffsetDateTime>,
+}
+
 /// A registered token issuer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuerRecord {
@@ -619,6 +640,15 @@ pub trait KeyStore: Send + Sync {
         domain_id: &Id,
         scope_hmac: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<(FactId, Id)>, StoreError>> + Send;
+
+    /// Every fact filed under a subject, shredded ones included, oldest first, at most `limit`. Used to answer
+    /// a data-subject access request (GDPR art. 15) without opening any value.
+    fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject_hmac: &[u8; 32],
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<SubjectFact>, StoreError>> + Send;
 
     /// The active key versions of a subject, and the bik version it was made with.
     fn subject_active_versions(

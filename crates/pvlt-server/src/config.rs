@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::GdprMode;
 use crate::bucket::S3Config;
 use pvlt_format::Id;
 use uuid::Uuid;
@@ -61,6 +62,9 @@ pub struct Config {
     pub sweep_interval: Option<Duration>,
     /// How old an unkeyed object must be before the sweeper may delete it.
     pub sweep_grace: Duration,
+    /// GDPR mode and which of its parts are on (`PVLT_GDPR_MODE`, `PVLT_GDPR_EXPORT`,
+    /// `PVLT_GDPR_ADMIN_INVENTORY`).
+    pub gdpr: GdprMode,
     /// A plaintext data listener. Development builds only.
     #[cfg(feature = "dev-insecure")]
     pub insecure_listen: Option<SocketAddr>,
@@ -193,8 +197,13 @@ impl Env {
     }
 
     fn flag(&self, name: &str) -> Result<bool, ConfigError> {
+        self.flag_or(name, false)
+    }
+
+    fn flag_or(&self, name: &str, default: bool) -> Result<bool, ConfigError> {
         match self.get(name) {
-            None | Some("0" | "false") => Ok(false),
+            None => Ok(default),
+            Some("0" | "false") => Ok(false),
             Some("1" | "true") => Ok(true),
             Some(_) => Err(bad(format!("{name} must be true or false"))),
         }
@@ -331,6 +340,11 @@ impl Config {
             },
             sweep_interval: (sweep_secs > 0).then(|| Duration::from_secs(sweep_secs)),
             sweep_grace: Duration::from_secs(env.number("PVLT_SWEEP_GRACE_SECS", 3600)?),
+            gdpr: GdprMode {
+                enabled: env.flag("PVLT_GDPR_MODE")?,
+                export: env.flag_or("PVLT_GDPR_EXPORT", true)?,
+                admin_inventory: env.flag_or("PVLT_GDPR_ADMIN_INVENTORY", true)?,
+            },
             #[cfg(feature = "dev-insecure")]
             insecure_listen,
         })
@@ -466,6 +480,30 @@ mod tests {
         std::fs::write(f.0.join("secret"), "\n").unwrap();
         let err = Config::load(&env(&base(&f))).unwrap_err();
         assert!(err.0.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn gdpr_mode_is_off_by_default_and_its_intrusive_parts_can_be_turned_off_one_by_one() {
+        let f = Files::new("gdpr");
+        let off = Config::load(&env(&base(&f))).unwrap().gdpr;
+        assert!(!off.enabled && !off.export_enabled() && !off.admin_inventory_enabled());
+
+        let on = Config::load(&env(&with(base(&f), "PVLT_GDPR_MODE", "true")))
+            .unwrap()
+            .gdpr;
+        assert_eq!(on, GdprMode::on());
+
+        let pairs = with(
+            with(base(&f), "PVLT_GDPR_MODE", "true"),
+            "PVLT_GDPR_ADMIN_INVENTORY",
+            "false",
+        );
+        let pairs = with(pairs, "PVLT_GDPR_EXPORT", "0");
+        let narrow = Config::load(&env(&pairs)).unwrap().gdpr;
+        assert!(narrow.enabled && !narrow.export_enabled() && !narrow.admin_inventory_enabled());
+
+        let err = Config::load(&env(&with(base(&f), "PVLT_GDPR_MODE", "yes"))).unwrap_err();
+        assert!(err.0.contains("PVLT_GDPR_MODE"), "{err}");
     }
 
     #[cfg(not(feature = "dev-insecure"))]

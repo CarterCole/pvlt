@@ -12,7 +12,7 @@ use pvlt_core::store::KeyStore;
 use serde_json::{Value, json};
 
 use crate::app::App;
-use crate::{INSECURE_BUILD, blobs, compat, v2};
+use crate::{INSECURE_BUILD, blobs, compat, gdpr, v2};
 
 /// The largest request body. A value is at most 4 MiB, and JSON escaping can grow it.
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -30,6 +30,7 @@ where
         .with_state(Arc::clone(&app))
         .merge(compat::router(Arc::clone(&app)))
         .merge(v2::router(Arc::clone(&app)))
+        .merge(gdpr::data_router(Arc::clone(&app)))
         .merge(blobs::router(app))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }

@@ -44,7 +44,7 @@ use crate::rng;
 use crate::store::{
     AuditAppend, AuditFilter, AuditRecord, Destroyed, DomainRecord, DueFact, FactId, FactKind,
     KeyStore, LedgerAppend, NewFact, NewSubjectKey, ReplayEffect, ShredFact, ShredPlan,
-    ShredSubject, State, StoreError,
+    ShredSubject, State, StoreError, SubjectFact,
 };
 
 /// The largest blob accepted by default: 256 MiB.
@@ -74,6 +74,9 @@ pub const MAX_FACT_TYPE_LEN: usize = 64;
 
 /// The longest subject, in bytes. Subjects are opaque ids like `user:123`; this only stops abuse.
 pub const MAX_SUBJECT_LEN: usize = 256;
+
+/// The most facts [`Engine::subject_facts`] lists for one subject.
+pub const MAX_SUBJECT_FACTS: u32 = 10_000;
 
 /// How many times a shred re-reads and retries when the ledger moves under it. Shreds of one domain take turns,
 /// and every round one of them wins, so a burst of N concurrent shreds needs up to N rounds. Shreds are rare, so
@@ -590,6 +593,24 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
         let domain = self.store.domain(domain_id).await?;
         self.keyring
             .with_domain(domain_id, &domain.keys, |dk| dk.subject_hmac(subject))
+    }
+
+    /// Every fact filed under a subject, shredded ones included, without opening any value: what a data-subject
+    /// access request (GDPR art. 15) lists. At most [`MAX_SUBJECT_FACTS`]; the caller says so when it is full.
+    pub async fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject: &str,
+    ) -> Result<([u8; 32], Vec<SubjectFact>), VaultError> {
+        if subject.is_empty() || subject.len() > MAX_SUBJECT_LEN {
+            return Err(VaultError::Invalid("subject is empty or too long"));
+        }
+        let hmac = self.subject_hmac(domain_id, subject).await?;
+        let facts = self
+            .store
+            .subject_facts(domain_id, &hmac, MAX_SUBJECT_FACTS)
+            .await?;
+        Ok((hmac, facts))
     }
 
     /// The blind identifier of a scope in a domain.
