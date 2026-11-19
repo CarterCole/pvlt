@@ -83,3 +83,35 @@ by the vectors; none is frozen. PLAN.md section 1.2 has the reasons.
   supplied by the caller on OPV import (C3), so the bucket key and header use an id the vault always makes itself.
 - **D3. Backups use `age` with a hybrid post-quantum recipient**, not raw HPKE (REQUIREMENTS 3.6.4). It is the
   a common tool for bucket backups. The `age` pq recipient version still needs checking.
+
+## Self-review before production (2026-11-19)
+
+An internal review (not the independent review of gate 8) found twelve problems. All are fixed; each fix has a
+test. Behaviour that changed:
+
+- **Changes to who may do what need two admins.** With two or more admins, setting a policy, registering an issuer
+  and re-enabling one are requests a different admin approves (`/v2/admin/changes`). Before, one admin could register
+  an issuer of their own, drop `restricted_types` and read anything, defeating threat T6 and dual control. With one
+  admin, changes still apply at once and the server warns.
+- **Admin actions are audited first, fail closed.** An access-changing admin action, or an audit query, does not happen
+  if its audit entry cannot be written.
+- **The compat token fails closed.** With no `compat` role it is refused everything (it used to be allowed
+  everything), and it can never read a `restricted_types` fact (it used to skip dual control).
+- **Rate-limit totals.** `total_*_per_hour` caps every caller of a role together; the per-caller limits alone let an
+  issuer that varies `caller` read without limit (threat T5). The limiter's table is now bounded, and at most 600
+  refusals an hour per issuer reach the audit log.
+- **Blob uploads go to a staging object** that completion copies into place, so a still-valid upload address cannot
+  replace a blob after it was checked or reviewed.
+- **Approvals name their reader.** `POST /v2/admin/approvals` takes the `caller` who may spend it.
+- **Unseal shares are checked on arrival** against hashes recorded at `init` (vaults initialised before this have none
+  and keep the old behaviour, except that a conflicting duplicate is now refused loudly, not dropped).
+- **Backups are signed** by the backup job and restore refuses an unsigned or foreign one unless `--allow-unsigned`.
+- **Secrets from files:** a password in `PVLT_DATABASE_URL` is refused in a default build (use `_FILE`); the compat
+  token needs 16 characters.
+- **Responses carrying a value or a key** are serialised into buffers wiped when sent, and marked `no-store`.
+- **Supply chain:** CI's insecure-build check now looks for a marker that exists (it matched nothing before) and
+  proves it can see it; actions and base images are pinned by commit and digest; a release waits for CI and the
+  image is published with an SBOM and provenance and signed with Sigstore.
+
+Schema version 6 (`0006_two_person_controls.sql`) adds `admin_changes`, `approvals.reader` and
+`seal_config.shamir_share_checks`. Pending admin changes are not in backups: they live a day and are re-requested.

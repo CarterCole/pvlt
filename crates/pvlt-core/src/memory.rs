@@ -16,10 +16,11 @@ use crate::keys::{WrappedDomainKeys, WrappedSigningKey, WrappedSubjectKey};
 use crate::objects::{ObjectError, ObjectInfo, ObjectKey, ObjectStore};
 use crate::seal::SealConfig;
 use crate::store::{
-    ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed, DomainRecord,
-    DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore, LedgerAppend,
-    LedgerHead, LedgerRecord, NewApproval, NewFact, NewSubjectKey, PolicyRecord, ReplayEffect,
-    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectFact, SubjectKeyRecord,
+    AdminChangeRecord, ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed,
+    DomainRecord, DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore,
+    LedgerAppend, LedgerHead, LedgerRecord, NewAdminChange, NewApproval, NewFact, NewSubjectKey,
+    PolicyRecord, ReplayEffect, ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectFact,
+    SubjectKeyRecord,
 };
 use uuid::Uuid;
 
@@ -43,6 +44,7 @@ struct KeyState {
     issuers: Vec<IssuerRecord>,
     policies: Vec<PolicyRecord>,
     approvals: HashMap<Uuid, ApprovalRecord>,
+    admin_changes: HashMap<Uuid, AdminChangeRecord>,
 }
 
 fn purpose_byte(p: SignPurpose) -> u8 {
@@ -716,6 +718,7 @@ impl KeyStore for MemKeyStore {
             break_glass: new.break_glass,
             expires_at: new.expires_at,
             used: false,
+            reader: Some(new.reader.clone()),
         };
         s.approvals.insert(new.id, rec.clone());
         Ok(rec)
@@ -749,6 +752,7 @@ impl KeyStore for MemKeyStore {
         domain_id: &Id,
         id: &Uuid,
         fact_id: &FactId,
+        caller: &str,
         now: OffsetDateTime,
     ) -> Result<(), StoreError> {
         let mut s = lock(&self.state);
@@ -761,11 +765,63 @@ impl KeyStore for MemKeyStore {
             || a.approved_by.is_none()
             || a.used
             || a.expires_at <= now
+            || a.reader.as_deref() != Some(caller)
         {
             return Err(StoreError::Conflict("approval is not valid"));
         }
         a.used = true;
         Ok(())
+    }
+
+    async fn create_admin_change(
+        &self,
+        new: &NewAdminChange,
+    ) -> Result<AdminChangeRecord, StoreError> {
+        let mut s = lock(&self.state);
+        if s.admin_changes.contains_key(&new.id) {
+            return Err(StoreError::AlreadyExists);
+        }
+        let rec = AdminChangeRecord {
+            id: new.id,
+            kind: new.kind.clone(),
+            payload: new.payload.clone(),
+            requested_by: new.requested_by.clone(),
+            approved_by: None,
+            expires_at: new.expires_at,
+        };
+        s.admin_changes.insert(new.id, rec.clone());
+        Ok(rec)
+    }
+
+    async fn admin_change(&self, id: &Uuid) -> Result<AdminChangeRecord, StoreError> {
+        lock(&self.state)
+            .admin_changes
+            .get(id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn approve_admin_change(
+        &self,
+        id: &Uuid,
+        approver: &str,
+        now: OffsetDateTime,
+    ) -> Result<AdminChangeRecord, StoreError> {
+        let mut s = lock(&self.state);
+        let c = s.admin_changes.get_mut(id).ok_or(StoreError::NotFound)?;
+        if c.approved_by.is_some() {
+            return Err(StoreError::Conflict("already approved"));
+        }
+        if c.expires_at <= now {
+            return Err(StoreError::Conflict("the request expired"));
+        }
+        if c.requested_by == approver {
+            return Err(StoreError::Conflict(
+                "an approver must not be the requester",
+            ));
+        }
+        c.approved_by = Some(approver.to_owned());
+        Ok(c.clone())
     }
 
     async fn list_domains(&self) -> Result<Vec<Id>, StoreError> {

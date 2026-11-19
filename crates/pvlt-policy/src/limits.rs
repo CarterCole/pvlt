@@ -25,12 +25,22 @@ pub enum Verdict {
     },
 }
 
+/// How often a full limiter may scan for callers it can forget. Between scans a new caller is simply refused, so
+/// a flood of new names cannot make every request scan the whole table.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
 /// A sliding-window counter per `(caller, action)`.
 #[derive(Debug)]
 pub struct RateLimiter {
     window: Duration,
     max_keys: usize,
-    counts: Mutex<HashMap<(String, Action), VecDeque<Instant>>>,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    counts: HashMap<(String, Action), VecDeque<Instant>>,
+    last_sweep: Option<Instant>,
 }
 
 impl Default for RateLimiter {
@@ -39,41 +49,84 @@ impl Default for RateLimiter {
     }
 }
 
+impl State {
+    /// Drops attempts that have left the window from one queue.
+    fn trim(q: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= window)
+        {
+            q.pop_front();
+        }
+    }
+
+    /// Makes room for a new key if the table is full, at most once per [`SWEEP_EVERY`]. Returns whether there
+    /// is room.
+    fn room(&mut self, max_keys: usize, now: Instant, window: Duration) -> bool {
+        if self.counts.len() < max_keys {
+            return true;
+        }
+        let due = self
+            .last_sweep
+            .is_none_or(|t| now.saturating_duration_since(t) >= SWEEP_EVERY);
+        if due {
+            self.last_sweep = Some(now);
+            self.counts.retain(|_, q| {
+                q.back()
+                    .is_some_and(|t| now.saturating_duration_since(*t) < window)
+            });
+        }
+        self.counts.len() < max_keys
+    }
+}
+
 impl RateLimiter {
-    /// A limiter counting over `window`, remembering at most `max_keys` callers.
+    /// A limiter counting over `window`, remembering at most `max_keys` callers. When it is full of callers that
+    /// are all still inside the window, a caller it does not know yet is refused rather than let through: the
+    /// table can never grow past `max_keys`.
     pub fn new(window: Duration, max_keys: usize) -> Self {
         Self {
             window,
             max_keys,
-            counts: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
         }
     }
 
     /// Counts an attempt unless it would exceed `limit` in the window ending at `now`. A limit of 0 refuses
     /// everything.
     pub fn check(&self, caller: &str, action: Action, limit: u32, now: Instant) -> Verdict {
-        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
-        if counts.len() >= self.max_keys {
-            // Forget callers with nothing left in the window before taking a new one.
-            counts.retain(|_, q| {
-                q.back()
-                    .is_some_and(|t| now.saturating_duration_since(*t) < self.window)
-            });
+        self.check_all(&[(caller, action, limit)], now)
+    }
+
+    /// Counts one attempt against every `(key, action, limit)` given, or against none of them: if any is over
+    /// its limit nothing is counted and the longest wait is returned. This is how a per-caller limit and a
+    /// role's total apply to one request without one of them counting a request the other refused.
+    pub fn check_all(&self, limits: &[(&str, Action, u32)], now: Instant) -> Verdict {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut wait: Option<Duration> = None;
+        for (key, action, limit) in limits {
+            let k = ((*key).to_owned(), *action);
+            if !state.counts.contains_key(&k) && !state.room(self.max_keys, now, self.window) {
+                wait = Some(wait.map_or(SWEEP_EVERY, |w| w.max(SWEEP_EVERY)));
+                continue;
+            }
+            let q = state.counts.entry(k).or_default();
+            State::trim(q, now, self.window);
+            if q.len() >= usize::try_from(*limit).unwrap_or(usize::MAX) {
+                let retry_after = q.front().map_or(self.window, |t| {
+                    (*t + self.window).saturating_duration_since(now)
+                });
+                wait = Some(wait.map_or(retry_after, |w| w.max(retry_after)));
+            }
         }
-        let q = counts.entry((caller.to_owned(), action)).or_default();
-        while q
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= self.window)
-        {
-            q.pop_front();
-        }
-        if q.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
-            let retry_after = q.front().map_or(self.window, |t| {
-                (*t + self.window).saturating_duration_since(now)
-            });
+        if let Some(retry_after) = wait {
             return Verdict::Limited { retry_after };
         }
-        q.push_back(now);
+        for (key, action, _) in limits {
+            if let Some(q) = state.counts.get_mut(&((*key).to_owned(), *action)) {
+                q.push_back(now);
+            }
+        }
         Verdict::Allowed
     }
 }
@@ -157,7 +210,58 @@ mod tests {
         for i in 0..200 {
             l.check(&format!("caller-{i}"), Action::Read, 5, t0 + secs(i));
         }
-        let n = l.counts.lock().unwrap().len();
-        assert!(n <= 20, "{n} callers are remembered");
+        let n = l.state.lock().unwrap().counts.len();
+        assert!(n <= 8, "{n} callers are remembered");
+    }
+
+    #[test]
+    fn a_full_table_of_live_callers_refuses_new_ones_and_never_grows() {
+        let l = RateLimiter::new(secs(100), 8);
+        let t0 = Instant::now();
+        for i in 0..8 {
+            assert_eq!(
+                l.check(&format!("live-{i}"), Action::Read, 5, t0),
+                Verdict::Allowed
+            );
+        }
+        // Every one of the eight is still in the window: a ninth name is refused, a known one still works.
+        for i in 0..1000 {
+            assert!(matches!(
+                l.check(&format!("flood-{i}"), Action::Read, 5, t0 + secs(1)),
+                Verdict::Limited { .. }
+            ));
+        }
+        assert_eq!(
+            l.check("live-0", Action::Read, 5, t0 + secs(1)),
+            Verdict::Allowed
+        );
+        assert_eq!(l.state.lock().unwrap().counts.len(), 8);
+        // Once they leave the window there is room again.
+        assert_eq!(
+            l.check("new", Action::Read, 5, t0 + secs(200)),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn check_all_counts_every_key_or_none() {
+        let l = RateLimiter::new(secs(100), 1000);
+        let t0 = Instant::now();
+        // A total of 3 over every caller, and 2 per caller.
+        let mut allowed = 0;
+        for i in 0..10 {
+            let caller = format!("c{}", i % 5);
+            if l.check_all(
+                &[(&caller, Action::Read, 2), ("total", Action::Read, 3)],
+                t0,
+            ) == Verdict::Allowed
+            {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3, "the total holds however many callers there are");
+        // The per-caller counts did not move for the refused attempts: c4 has used nothing.
+        assert_eq!(l.check("c4", Action::Read, 2, t0), Verdict::Allowed);
+        assert_eq!(l.check("c4", Action::Read, 2, t0), Verdict::Allowed);
     }
 }

@@ -41,12 +41,16 @@ type Server = Engine<PgStore, Objects, LogAuditor>;
 const USAGE: &str = "usage:
   pvlt init [--threshold N] [--shares N]    make the root key and print the unseal shares (once)
   pvlt serve                                start the server, sealed; unseal it with POST /v2/sys/unseal
-  pvlt backup --out FILE --recipient R...   write an encrypted backup of the key store
-  pvlt restore --in FILE --identity FILE    load a backup into an empty key store, then replay the ledger
-  pvlt scrub-backup --in FILE --identity FILE --out FILE --recipient R...
+  pvlt backup --out FILE --recipient R... --signing-key-file FILE
+                                            write a signed, encrypted backup of the key store
+  pvlt restore --in FILE --identity FILE (--verify-key HEX | --allow-unsigned)
+                                            load a backup into an empty key store, then replay the ledger
+  pvlt scrub-backup --in FILE --identity FILE (--verify-key HEX | --allow-unsigned)
+                    --out FILE --recipient R... --signing-key-file FILE
                                             rewrite a backup so later shreds are already applied
-                                            (needs PVLT_SCRATCH_DATABASE_URL, an empty database)
+                                            (needs PVLT_SCRATCH_DATABASE_URL(_FILE), an empty database)
   pvlt backup-keygen                        make an age key pair for backups
+  pvlt backup-signing-keygen                make the Ed25519 key a backup job signs backups with
   pvlt issuer-keygen                        make an Ed25519 key pair for a token issuer
   pvlt mint-token --seed-file F --key-id N [--caller C] [--subject S] [--role R]... [--purpose P] [--reason T]
                   [--action A]... [--fact UUID] [--scope S] [--resource-subject S] [--grant G]...
@@ -92,6 +96,18 @@ fn main() -> ExitCode {
             );
             Ok(())
         }
+        Some("backup-signing-keygen") if args.len() == 1 => match backup::SigningKey::generate() {
+            Ok(key) => {
+                println!("{}", key.to_hex().as_str());
+                eprintln!(
+                    "Signing key above (keep it with the backup job only, never with the backups). Give this \
+                     public key to `pvlt restore --verify-key`:\n{}",
+                    hex::encode(key.public())
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        },
         Some("audit-verify") if args.len() == 1 => runtime.block_on(audit_verify_cmd()),
         Some("import-opv") => runtime.block_on(import_opv_cmd(rest)),
         Some("issuer-keygen") if args.len() == 1 => {
@@ -266,12 +282,47 @@ async fn init(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The backup signing key named by `--signing-key-file`.
+fn signing_key(args: &[String]) -> Result<backup::SigningKey, String> {
+    let text = secret_from_file(&one(args, "--signing-key-file")?)?;
+    backup::SigningKey::from_hex(&text).map_err(|e| e.to_string())
+}
+
+/// Whom a backup being read must be signed by: `--verify-key HEX`, or `--allow-unsigned` for a backup made
+/// before backups were signed.
+fn trust(args: &[String]) -> Result<backup::Trust, String> {
+    let keys = values(args, "--verify-key");
+    let unsigned = args.iter().any(|a| a == "--allow-unsigned");
+    match (keys.as_slice(), unsigned) {
+        ([key], false) => backup::Trust::signer_hex(key).map_err(|e| e.to_string()),
+        ([], true) => {
+            eprintln!(
+                "warning: --allow-unsigned: nothing proves who made this backup. Use it only for a backup that \
+                 predates signed backups and whose origin you know."
+            );
+            Ok(backup::Trust::Unsigned)
+        }
+        _ => {
+            Err("give --verify-key once (the backup job's public key), or --allow-unsigned".into())
+        }
+    }
+}
+
+/// A database URL from `NAME_FILE` or `NAME` (see `Env::database_url`).
+fn database_url(name: &str) -> Result<String, String> {
+    Env::from_process()
+        .database_url(name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{name}_FILE or {name} is required"))
+}
+
 async fn backup_cmd(args: &[String]) -> Result<(), String> {
     let out = one(args, "--out")?;
     let recipients = values(args, "--recipient");
-    let url = std::env::var("PVLT_DATABASE_URL").map_err(|_| "PVLT_DATABASE_URL is required")?;
+    let signer = signing_key(args)?;
+    let url = database_url("PVLT_DATABASE_URL")?;
     let store = connect(&url, false).await?;
-    let rows = tools::backup_to_file(&store, &out, &recipients)
+    let rows = tools::backup_to_file(&store, &out, &recipients, &signer)
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("wrote {} ({rows} rows, encrypted)", out.display());
@@ -280,13 +331,14 @@ async fn backup_cmd(args: &[String]) -> Result<(), String> {
 
 async fn restore_cmd(args: &[String]) -> Result<(), String> {
     let (input, identity) = (one(args, "--in")?, one(args, "--identity")?);
+    let trust = trust(args)?;
     let config = Config::load_tool(&Env::from_process()).map_err(|e| e.to_string())?;
     let store = connect(&config.database_url, true).await?;
     tools::must_be_empty(&store)
         .await
         .map_err(|e| e.to_string())?;
     let engine = engine(&config, store.clone())?;
-    let report = tools::restore_from_file(&store, &engine, &input, &identity)
+    let report = tools::restore_from_file(&store, &engine, &input, &identity, &trust)
         .await
         .map_err(|e| e.to_string())?;
     eprintln!(
@@ -303,8 +355,10 @@ async fn scrub_cmd(args: &[String]) -> Result<(), String> {
         one(args, "--out")?,
     );
     let recipients = values(args, "--recipient");
-    let scratch_url = std::env::var("PVLT_SCRATCH_DATABASE_URL")
-        .map_err(|_| "PVLT_SCRATCH_DATABASE_URL is required: an empty database to work in")?;
+    let trust = trust(args)?;
+    let signer = signing_key(args)?;
+    let scratch_url = database_url("PVLT_SCRATCH_DATABASE_URL")
+        .map_err(|e| format!("{e}: an empty database to work in"))?;
     let config = Config::load_tool(&Env::from_process()).map_err(|e| e.to_string())?;
     if scratch_url == config.database_url {
         return Err("PVLT_SCRATCH_DATABASE_URL must not be the live database".into());
@@ -314,9 +368,18 @@ async fn scrub_cmd(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let engine = engine(&config, scratch.clone())?;
-    let report = tools::scrub_backup(&scratch, &engine, &input, &identity, &out, &recipients)
-        .await
-        .map_err(|e| e.to_string())?;
+    let report = tools::scrub_backup(
+        &scratch,
+        &engine,
+        &input,
+        &identity,
+        &trust,
+        &out,
+        &recipients,
+        &signer,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     eprintln!(
         "wrote {}. {} ledger entries were applied that the backup did not have.",
         out.display(),
@@ -536,7 +599,21 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot load issuers and policy: {e}"))?;
     if app.admins.len() < 2 {
         tracing::warn!(
-            "fewer than two admins are configured, so dual-control approvals cannot be granted"
+            "fewer than two admins are configured, so dual-control approvals cannot be granted, and policy and \
+             issuer changes take effect on one admin's word"
+        );
+    }
+    let unlimited = app
+        .access()
+        .policy
+        .roles_without_totals()
+        .iter()
+        .map(|r| (*r).to_owned())
+        .collect::<Vec<_>>();
+    if !unlimited.is_empty() {
+        tracing::warn!(
+            roles = ?unlimited,
+            "these roles limit each caller but set no total, so an issuer that varies the caller is not held"
         );
     }
     if app.break_glass {
@@ -546,6 +623,10 @@ async fn run() -> Result<(), String> {
     }
     if app.compat_token.is_none() {
         tracing::warn!("no compat token is set, so /api/v1 refuses every request");
+    } else if !app.access().policy.has_compat_role() {
+        tracing::warn!(
+            "the policy has no compat role, so /api/v1 refuses every request until one is set"
+        );
     }
     if app.gdpr.enabled {
         tracing::info!(

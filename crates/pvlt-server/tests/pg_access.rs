@@ -35,8 +35,12 @@ fn approval(
         requested_by: by.to_owned(),
         break_glass,
         expires_at: common::micros(OffsetDateTime::now_utc()) + Duration::seconds(ttl_secs),
+        reader: READER.to_owned(),
     }
 }
+
+/// The caller every approval in these tests is made out to.
+const READER: &str = "user:77";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PVLT_TEST_DATABASE_URL; run scripts/test-db.sh start"]
@@ -125,7 +129,7 @@ async fn an_approval_needs_a_second_person_and_works_once() {
     // Not usable while pending.
     assert!(matches!(
         w.store()
-            .consume_approval(&d, &req.id, &f.fact_id, now)
+            .consume_approval(&d, &req.id, &f.fact_id, READER, now)
             .await,
         Err(StoreError::Conflict(_))
     ));
@@ -145,27 +149,33 @@ async fn an_approval_needs_a_second_person_and_works_once() {
         Err(StoreError::Conflict(_))
     ));
 
-    // It covers one fact, in one domain.
+    // It covers one fact, in one domain, for one caller.
     assert!(matches!(
         w.store()
-            .consume_approval(&d, &req.id, &other.fact_id, now)
+            .consume_approval(&d, &req.id, &other.fact_id, READER, now)
             .await,
         Err(StoreError::Conflict(_))
     ));
     assert!(matches!(
         w.store()
-            .consume_approval(&[9; 16], &req.id, &f.fact_id, now)
+            .consume_approval(&d, &req.id, &f.fact_id, "user:someone-else", now)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        w.store()
+            .consume_approval(&[9; 16], &req.id, &f.fact_id, READER, now)
             .await,
         Err(StoreError::Conflict(_))
     ));
     w.store()
-        .consume_approval(&d, &req.id, &f.fact_id, now)
+        .consume_approval(&d, &req.id, &f.fact_id, READER, now)
         .await
         .unwrap();
     // Used once.
     assert!(matches!(
         w.store()
-            .consume_approval(&d, &req.id, &f.fact_id, now)
+            .consume_approval(&d, &req.id, &f.fact_id, READER, now)
             .await,
         Err(StoreError::Conflict(_))
     ));
@@ -196,7 +206,7 @@ async fn an_approval_expires_and_break_glass_is_the_only_way_to_approve_alone() 
     assert!(
         matches!(
             w.store()
-                .consume_approval(&d, &ok.id, &f.fact_id, later)
+                .consume_approval(&d, &ok.id, &f.fact_id, READER, later)
                 .await,
             Err(StoreError::Conflict(_))
         ),
@@ -208,7 +218,7 @@ async fn an_approval_expires_and_break_glass_is_the_only_way_to_approve_alone() 
     assert_eq!(made.approved_by.as_deref(), Some("admin-a"));
     assert!(made.break_glass);
     w.store()
-        .consume_approval(&d, &glass.id, &f.fact_id, now)
+        .consume_approval(&d, &glass.id, &f.fact_id, READER, now)
         .await
         .unwrap();
 
@@ -259,6 +269,7 @@ async fn of_many_concurrent_uses_of_one_approval_exactly_one_succeeds() {
                     &domain,
                     &id,
                     &fact_id,
+                    READER,
                     common::micros(OffsetDateTime::now_utc()),
                 )
                 .await

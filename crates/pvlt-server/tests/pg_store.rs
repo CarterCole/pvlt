@@ -58,6 +58,7 @@ async fn migrations_are_repeatable_and_make_the_tables() {
         tables,
         [
             "_sqlx_migrations",
+            "admin_changes",
             "approvals",
             "audit",
             "domains",

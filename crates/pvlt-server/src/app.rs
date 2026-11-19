@@ -194,6 +194,12 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
         self
     }
 
+    /// Whether changes to who may do what (policy, issuers) need a second admin. They do whenever there are two
+    /// admins to ask; with one, that admin's word is all there is, and the server says so at start.
+    pub fn changes_need_two_admins(&self) -> bool {
+        self.admins.len() >= 2
+    }
+
     /// Sets the longest request-token lifetime and whether break-glass approvals are allowed.
     pub fn with_access_limits(mut self, max_token_ttl: i64, break_glass: bool) -> Self {
         self.max_token_ttl = max_token_ttl;
@@ -291,6 +297,11 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
 
     /// Takes one share. When enough distinct shares have arrived it tries to unseal, and whatever the outcome
     /// it forgets them, so a wrong batch cannot be topped up one share at a time.
+    ///
+    /// A vault initialised with share checks refuses a share that is not the one dealt under its number the
+    /// moment it arrives, so nobody who can reach this route can spoil an unseal by sending a forged share first.
+    /// For an older vault without checks, a second, different share under a number already held is refused
+    /// loudly instead of being dropped, so the holder of the real one finds out at once.
     pub fn submit_share(&self, text: &str) -> Result<UnsealStatus, ApiError> {
         if !self.engine.keyring().is_sealed() {
             return Ok(self.unseal_status());
@@ -306,13 +317,27 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
         if info.threshold != self.threshold() {
             return Err(ApiError::BadRequest("share does not match this vault"));
         }
+        pvlt_core::seal::check_share(&self.seal_config, &share)?;
         let mut held = self.shares.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut have = Vec::with_capacity(held.len());
+        let mut same_number = None;
         for s in held.iter() {
-            have.push(s.info()?.index);
+            if s.info()?.index == info.index {
+                same_number = Some(s.to_text());
+            }
         }
-        if !have.contains(&info.index) && held.len() < MAX_PENDING {
-            held.push(share);
+        match same_number {
+            None if held.len() < MAX_PENDING => held.push(share),
+            None => {}
+            Some(previous)
+                if !bool::from(previous.as_bytes().ct_eq(share.to_text().as_bytes())) =>
+            {
+                return Err(ApiError::Vault(VaultError::Conflict(
+                    "a different share with this number was already submitted; seal the vault to clear \
+                     pending shares and start again",
+                )));
+            }
+            // The same share again: it is already held.
+            Some(_) => {}
         }
         let batch = if held.len() >= usize::from(self.threshold()) {
             Some(core::mem::take(&mut *held))

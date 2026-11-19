@@ -110,7 +110,9 @@ impl Authn {
 }
 
 /// Reports a refusal to the log lines and, durably, to the audit log (best effort: a refusal is a refusal even
-/// if it cannot be written down), and returns the error to send.
+/// if it cannot be written down), and returns the error to send. At most [`DENIALS_AUDITED_PER_HOUR`] refusals
+/// an hour per issuer reach the audit log, so a holder of a valid token cannot grow it, or hold up the reads that
+/// wait on it, by asking for what it may not have. Every refusal still reaches the log lines.
 pub(crate) async fn refuse<K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &App<K, O, A>,
     authn: &Authn,
@@ -121,24 +123,35 @@ pub(crate) async fn refuse<K: KeyStore, O: ObjectStore, A: Auditor>(
     let principal = authn.principal();
     let roles = authn.accepted_roles();
     app.engine.report(&principal, audit_action, fact_id, code);
-    let _ = app
-        .engine
-        .audit_event(
-            &app.domain,
-            Kind::Deny,
-            &authn.caller(&principal, &roles),
-            audit_action.name(),
-            fact_id,
-            None,
-            Some(code),
-        )
-        .await;
+    let audited = app.limiter.check(
+        &format!("denied|{}", authn.issuer),
+        Action::Read,
+        DENIALS_AUDITED_PER_HOUR,
+        Instant::now(),
+    ) == Verdict::Allowed;
+    if audited {
+        let _ = app
+            .engine
+            .audit_event(
+                &app.domain,
+                Kind::Deny,
+                &authn.caller(&principal, &roles),
+                audit_action.name(),
+                fact_id,
+                None,
+                Some(code),
+            )
+            .await;
+    }
     ApiError::Forbidden(code)
 }
 
 /// How many refused tokens an hour are written to the audit log. Past this they are counted in the log lines
 /// only, so a flood of junk cannot grow the audit log without bound.
 const UNAUTHENTICATED_AUDITED_PER_HOUR: u32 = 600;
+
+/// How many refusals of valid tokens an hour, per issuer, are written to the audit log.
+const DENIALS_AUDITED_PER_HOUR: u32 = 600;
 
 pub(crate) async fn authenticate<K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &App<K, O, A>,
@@ -290,19 +303,35 @@ pub(crate) async fn authorize<K: KeyStore, O: ObjectStore, A: Auditor>(
     Ok(allowed)
 }
 
-/// Applies the role's limit for an action to this caller.
+/// Applies the role's limits for an action: its per-caller limit to this caller, and its total to every caller
+/// of the role together. Both are counted, or neither.
+///
+/// The caller is a claim the issuer writes, so the per-caller limit alone holds one end user, not a service that
+/// mints a new caller name for each request. The total is what holds that service (threat T5); a role with a
+/// per-caller limit and no total is reported at start and whenever the policy changes.
 pub fn rate_limit<K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &App<K, O, A>,
     allowed: &Allowed,
     caller: &str,
     action: Action,
 ) -> Result<(), ApiError> {
-    let Some(limit) = allowed.limits.for_action(action) else {
+    let per_caller = allowed
+        .limits
+        .for_action(action)
+        .map(|l| (format!("caller|{}|{}", allowed.role, caller), l));
+    let total = allowed
+        .limits
+        .total_for_action(action)
+        .map(|l| (format!("total|{}", allowed.role), l));
+    let checks: Vec<(&str, Action, u32)> = [&per_caller, &total]
+        .into_iter()
+        .flatten()
+        .map(|(k, l)| (k.as_str(), action, *l))
+        .collect();
+    if checks.is_empty() {
         return Ok(());
-    };
-    // Counted per role as well as per caller, so one role cannot be multiplied by minting many caller names.
-    let key = format!("{}|{}", allowed.role, caller);
-    match app.limiter.check(&key, action, limit, Instant::now()) {
+    }
+    match app.limiter.check_all(&checks, Instant::now()) {
         Verdict::Allowed => Ok(()),
         Verdict::Limited { retry_after } => {
             Err(ApiError::RateLimited(retry_after.as_secs().max(1)))
@@ -497,9 +526,10 @@ where
     Ok(Json(CreatedMany { ids }))
 }
 
-/// For a read of a restricted fact type: dual control. A second admin approved this read, once, and the token
-/// names the approval. The approval is spent before the value is opened, so a read that then fails cannot be
-/// retried on the same approval.
+/// For a read of a restricted fact type: dual control. A second admin approved this read of this fact by this
+/// caller, once, and the token names the approval. The approval is spent before the value is opened, so a read
+/// that then fails cannot be retried on the same approval. A token with no caller, or a different one, cannot
+/// spend it, so an approval id that leaks is no use to anyone else.
 pub(crate) async fn spend_approval<K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &App<K, O, A>,
     authn: &Authn,
@@ -517,9 +547,12 @@ pub(crate) async fn spend_approval<K: KeyStore, O: ObjectStore, A: Auditor>(
     else {
         return Err(refuse(app, authn, AuditAction::Read, Some(id), "approval_required").await);
     };
+    let Some(caller) = authn.claims.caller.as_deref() else {
+        return Err(refuse(app, authn, AuditAction::Read, Some(id), "approval_invalid").await);
+    };
     if app
         .engine
-        .consume_approval(&app.domain, &approval, &id)
+        .consume_approval(&app.domain, &approval, &id, caller)
         .await
         .is_err()
     {
@@ -528,15 +561,42 @@ pub(crate) async fn spend_approval<K: KeyStore, O: ObjectStore, A: Auditor>(
     Ok(())
 }
 
+/// A value on its way out. Borrowed from the value's own wiped buffer, so no unwiped copy is made here.
 #[derive(Serialize)]
-struct FactOut {
+pub(crate) struct ValueOut<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_b64: Option<&'a str>,
+}
+
+/// Text as `value`, anything else as base64 in `value_b64`. `b64` holds the base64 text, wiped when dropped.
+pub(crate) fn value_out<'a>(
+    value: &'a [u8],
+    b64: &'a mut zeroize::Zeroizing<String>,
+) -> ValueOut<'a> {
+    match std::str::from_utf8(value) {
+        Ok(text) => ValueOut {
+            value: Some(text),
+            value_b64: None,
+        },
+        Err(_) => {
+            STANDARD.encode_string(value, b64);
+            ValueOut {
+                value: None,
+                value_b64: Some(b64.as_str()),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FactOut<'a> {
     id: Uuid,
     #[serde(rename = "type")]
-    fact_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value_b64: Option<String>,
+    fact_type: &'a str,
+    #[serde(flatten)]
+    value: ValueOut<'a>,
 }
 
 pub(crate) fn parse_id(text: &str) -> Result<Uuid, ApiError> {
@@ -547,7 +607,7 @@ async fn read<K, O, A>(
     State(app): State<Arc<App<K, O, A>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<FactOut>, ApiError>
+) -> Result<axum::response::Response, ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,
@@ -580,15 +640,11 @@ where
     }
     spend_approval(&app, &authn, &allowed, id).await?;
     let fact = app.engine.read_fact(caller, &app.domain, &id).await?;
-    let (value, value_b64) = match String::from_utf8(fact.value.to_vec()) {
-        Ok(text) => (Some(text), None),
-        Err(_) => (None, Some(STANDARD.encode(fact.value.as_slice()))),
-    };
-    Ok(Json(FactOut {
+    let mut b64 = zeroize::Zeroizing::new(String::new());
+    Ok(crate::secret::json(&FactOut {
         id: fact.fact_id,
-        fact_type: fact.fact_type,
-        value,
-        value_b64,
+        fact_type: &fact.fact_type,
+        value: value_out(&fact.value, &mut b64),
     }))
 }
 

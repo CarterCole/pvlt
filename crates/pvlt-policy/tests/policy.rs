@@ -397,17 +397,24 @@ fn the_default_is_deny_for_every_request_against_an_empty_policy() {
 }
 
 #[test]
-fn the_compat_token_is_allowed_everything_unless_the_policy_defines_a_compat_role() {
-    let open = Policy::from_json(POLICY.as_bytes()).unwrap();
+fn the_compat_token_is_refused_everything_unless_the_policy_defines_a_compat_role() {
+    let none = Policy::from_json(POLICY.as_bytes()).unwrap();
+    assert!(!none.has_compat_role());
     for action in [Action::Create, Action::Read, Action::Shred] {
         let req = Request {
             action,
             fact_type: Some("ascii"),
             subject_matches: false,
         };
-        assert!(
-            matches!(open.decide_compat(&req), Decision::Allow(_)),
+        assert_eq!(
+            none.decide_compat(&req),
+            Decision::Deny(Denial::NoUsableRole),
             "{action:?}"
+        );
+        assert_eq!(
+            Policy::default().decide_compat(&req),
+            Decision::Deny(Denial::NoUsableRole),
+            "no policy at all: {action:?}"
         );
     }
     let narrowed = Policy::from_json(br#"{"version":1,"roles":{"compat":{"allow":[{"types":["*"],"actions":["create","read"]}],"limits":{"read_per_hour":10}}}}"#).unwrap();
@@ -440,6 +447,47 @@ fn the_compat_token_is_allowed_everything_unless_the_policy_defines_a_compat_rol
     assert_eq!(
         selfish.decide_compat(&read),
         Decision::Deny(Denial::ConditionFailed)
+    );
+}
+
+#[test]
+fn a_compat_read_of_a_restricted_type_is_flagged_for_dual_control() {
+    let p = Policy::from_json(br#"{"version":1,"restricted_types":["base64"],"roles":{"compat":{"allow":[{"types":["*"],"actions":["create","read"]}]}}}"#).unwrap();
+    let req = |action, t| Request {
+        action,
+        fact_type: Some(t),
+        subject_matches: false,
+    };
+    let flagged = |d: Decision| match d {
+        Decision::Allow(a) => a.restricted,
+        Decision::Deny(d) => panic!("{d:?}"),
+    };
+    assert!(flagged(p.decide_compat(&req(Action::Read, "base64"))));
+    assert!(!flagged(p.decide_compat(&req(Action::Read, "ascii"))));
+    // Only a read discloses; creating a restricted type needs nothing extra.
+    assert!(!flagged(p.decide_compat(&req(Action::Create, "base64"))));
+}
+
+#[test]
+fn totals_are_parsed_kept_in_canonical_form_and_reported_when_missing() {
+    let p = Policy::from_json(br#"{"version":1,"roles":{
+        "a":{"allow":[{"types":["*"],"actions":["read"]}],"limits":{"read_per_hour":5,"total_read_per_hour":50}},
+        "b":{"allow":[{"types":["*"],"actions":["read"]}],"limits":{"read_per_hour":5}},
+        "c":{"allow":[{"types":["*"],"actions":["read"]}]}}}"#).unwrap();
+    let a = p.roles["a"].limits;
+    assert_eq!(
+        (a.for_action(Action::Read), a.total_for_action(Action::Read)),
+        (Some(5), Some(50))
+    );
+    assert_eq!(p.roles_without_totals(), ["b"]);
+    let again = Policy::from_json(&p.canonical_json().unwrap()).unwrap();
+    assert_eq!(again, p);
+    // A policy without totals keeps the hash it had before totals existed.
+    let old = Policy::from_json(POLICY.as_bytes()).unwrap();
+    assert!(
+        !String::from_utf8(old.canonical_json().unwrap())
+            .unwrap()
+            .contains("total_")
     );
 }
 

@@ -27,6 +27,7 @@ pub mod gdpr;
 pub mod import_opv;
 pub mod pg;
 pub mod routes;
+pub mod secret;
 pub mod tls;
 pub mod tokens;
 pub mod tools;
@@ -34,3 +35,9 @@ pub mod v2;
 
 /// Whether this build contains the insecure conveniences. Reported on `/readyz` and logged at start.
 pub const INSECURE_BUILD: bool = cfg!(feature = "dev-insecure");
+
+/// A string that is in the binary exactly when the insecure conveniences are. CI looks for it: a default build
+/// must not contain it, and a `dev-insecure` build must, which proves the check can still see what it checks.
+#[cfg(feature = "dev-insecure")]
+#[used]
+pub static DEV_INSECURE_MARKER: &str = "pvlt-build-marker:dev-insecure-conveniences-present";

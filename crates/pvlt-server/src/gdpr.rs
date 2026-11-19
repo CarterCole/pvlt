@@ -107,9 +107,18 @@ struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     withheld: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
+    value: Option<Secret>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    value_b64: Option<String>,
+    value_b64: Option<Secret>,
+}
+
+/// A value in an export: wiped when the report is dropped.
+struct Secret(zeroize::Zeroizing<String>);
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
 }
 
 impl From<&SubjectFact> for Entry {
@@ -249,7 +258,7 @@ async fn subject_export<K, O, A>(
     State(app): State<Arc<App<K, O, A>>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Report>, ApiError>
+) -> Result<axum::response::Response, ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,
@@ -311,9 +320,13 @@ where
         }
         match app.engine.read_fact(caller, &app.domain, &f.fact_id).await {
             Ok(v) => {
-                match String::from_utf8(v.value.to_vec()) {
-                    Ok(text) => e.value = Some(text),
-                    Err(_) => e.value_b64 = Some(STANDARD.encode(v.value.as_slice())),
+                match std::str::from_utf8(&v.value) {
+                    Ok(text) => e.value = Some(Secret(zeroize::Zeroizing::new(text.to_owned()))),
+                    Err(_) => {
+                        let mut b64 = zeroize::Zeroizing::new(String::new());
+                        STANDARD.encode_string(v.value.as_slice(), &mut b64);
+                        e.value_b64 = Some(Secret(b64));
+                    }
                 }
                 e.status = "exported";
             }
@@ -323,7 +336,7 @@ where
         }
         out.push(e);
     }
-    Ok(Json(report(out, facts.len())))
+    Ok(crate::secret::json(&report(out, facts.len())))
 }
 
 /// `POST /v2/admin/subject/facts`: the fact list for an admin answering an access request. No values.

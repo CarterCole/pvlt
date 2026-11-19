@@ -85,13 +85,15 @@ fn encrypt(t: &BlobTicket, data: &[u8], pieces: usize) -> Vec<u8> {
     out
 }
 
+/// Uploads as a client would: to the blob's staging key, which is what its upload address names.
 async fn upload(e: &TestEngine, t: &BlobTicket, object: Vec<u8>) {
     e.objects()
         .put(
             &ObjectKey {
                 domain_id: t.domain_id,
                 object_id: t.object_id,
-            },
+            }
+            .staging(),
             object,
         )
         .await
@@ -317,6 +319,56 @@ async fn completion_checks_the_upload_without_reading_it() {
     // The real thing finally completes.
     upload(&e, &t, good).await;
     e.complete_blob(WHO, &domain(), &t.blob_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_upload_after_completion_cannot_change_what_a_reader_gets() {
+    let e = engine().await;
+    let original = vec![1u8; 3000];
+    let (id, t) = blob(&e, "user:1", &original).await;
+    let key = ObjectKey {
+        domain_id: domain(),
+        object_id: t.object_id,
+    };
+    // Completion moved the upload into place and removed the staging copy.
+    assert!(e.objects().get(&key.staging()).await.unwrap().is_none());
+
+    // An upload address handed out earlier still writes the staging key: a different, validly encrypted
+    // document of the same size. It is never what a reader gets.
+    upload(&e, &t, encrypt(&t, &vec![2u8; 3000], 100)).await;
+    let access = e.open_blob(WHO, &domain(), &id).await.unwrap();
+    let object = e.objects().get(&key).await.unwrap().unwrap();
+    assert_eq!(decrypt(&access, &object), original);
+    assert!(matches!(
+        e.complete_blob(WHO, &domain(), &id).await,
+        Err(VaultError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn an_object_put_where_readers_look_but_not_where_uploads_go_does_not_complete() {
+    let e = engine().await;
+    let data = vec![3u8; 2000];
+    let t = e
+        .create_blob(WHO, &domain(), &request("user:1", data.len()))
+        .await
+        .unwrap();
+    e.objects()
+        .put(
+            &ObjectKey {
+                domain_id: domain(),
+                object_id: t.object_id,
+            },
+            encrypt(&t, &data, 100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        e.complete_blob(WHO, &domain(), &t.blob_id)
+            .await
+            .unwrap_err(),
+        VaultError::Conflict("the object has not been uploaded")
+    );
 }
 
 fn clone_ticket(t: &BlobTicket) -> BlobTicket {

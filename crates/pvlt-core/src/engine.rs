@@ -620,17 +620,24 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
             .with_domain(domain_id, &domain.keys, |dk| dk.scope_hmac(scope))
     }
 
-    /// Uses a dual-control approval, once, for reading this fact. [`VaultError::Conflict`] if it is not a valid
-    /// approval for it.
+    /// Uses a dual-control approval, once, for `caller` reading this fact. [`VaultError::Conflict`] if it is not
+    /// a valid approval for that caller and that fact.
     pub async fn consume_approval(
         &self,
         domain_id: &Id,
         approval_id: &Uuid,
         fact_id: &FactId,
+        caller: &str,
     ) -> Result<(), VaultError> {
         Ok(self
             .store
-            .consume_approval(domain_id, approval_id, fact_id, OffsetDateTime::now_utc())
+            .consume_approval(
+                domain_id,
+                approval_id,
+                fact_id,
+                caller,
+                OffsetDateTime::now_utc(),
+            )
             .await?)
     }
 
@@ -2201,25 +2208,68 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
             return Err(VaultError::Conflict("the blob is already complete"));
         }
         let fact = &bundle.fact.fact;
-        let path = ObjectKey {
+        let key = ObjectKey {
             domain_id: *domain_id,
             object_id: fact.object_id,
-        }
-        .path();
-        let size = self
+        };
+        let (path, staging) = (key.path(), key.staging().path());
+        let want = blobfmt::sealed_len(info.len, info.chunk_size);
+        // The client uploaded to the staging key, which its upload address can still write. Check the size there
+        // first so nothing oversized is copied, then copy it to the object's own key, which only the vault
+        // writes, and check the copy: that is the object every reader gets.
+        let staged = self
             .objects
-            .head_path(&path)
+            .head_path(&staging)
             .await
             .map_err(object_error)?
             .ok_or(VaultError::Conflict("the object has not been uploaded"))?;
-        if Some(size) != blobfmt::sealed_len(info.len, info.chunk_size) {
+        if Some(staged) != want {
+            return Err(VaultError::Conflict(
+                "the object is not the size that was declared",
+            ));
+        }
+        self.objects
+            .copy_path(&staging, &path)
+            .await
+            .map_err(object_error)?;
+        let checked = self
+            .check_blob_object(domain_id, &bundle, &info, &path, want)
+            .await;
+        if let Err(e) = checked {
+            // The copy is not a blob anyone may read. Best effort: the sweeper removes it otherwise.
+            let _ = self.objects.delete_path(&path).await;
+            return Err(e);
+        }
+        self.store.complete_blob(domain_id, blob_id).await?;
+        // Best effort: an upload address that is still valid can write it again, and the sweeper removes it.
+        let _ = self.objects.delete_path(&staging).await;
+        Ok(())
+    }
+
+    /// Checks a blob object's exact size and its header against the blob's row and key commitment.
+    async fn check_blob_object(
+        &self,
+        domain_id: &Id,
+        bundle: &crate::store::FactBundle,
+        info: &crate::store::BlobInfo,
+        path: &str,
+        want: Option<u64>,
+    ) -> Result<(), VaultError> {
+        let fact = &bundle.fact.fact;
+        let size = self
+            .objects
+            .head_path(path)
+            .await
+            .map_err(object_error)?
+            .ok_or(VaultError::Conflict("the object has not been uploaded"))?;
+        if Some(size) != want {
             return Err(VaultError::Conflict(
                 "the object is not the size that was declared",
             ));
         }
         let header = self
             .objects
-            .get_range(&path, 0, 104)
+            .get_range(path, 0, 104)
             .await
             .map_err(object_error)?
             .ok_or(VaultError::Conflict("the object has not been uploaded"))?;
@@ -2238,16 +2288,18 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
                 && h.chunk_size == info.chunk_size
                 && matches!(h.suite, Suite::Aes256Gcm | Suite::XChaCha20Poly1305)
         });
-        if !ok {
-            return Err(VaultError::Conflict(
+        if ok {
+            Ok(())
+        } else {
+            Err(VaultError::Conflict(
                 "the uploaded header does not match the blob",
-            ));
+            ))
         }
-        Ok(self.store.complete_blob(domain_id, blob_id).await?)
     }
 
-    /// Where a blob that is waiting for its upload goes, and how big the object must be. Does not disclose
-    /// anything, so it is not audited. [`VaultError::Conflict`] if the blob is not waiting for an upload.
+    /// Where a blob that is waiting for its upload goes (its staging key, see [`ObjectKey::staging`]), and how
+    /// big the object must be. Does not disclose anything, so it is not audited. [`VaultError::Conflict`] if the
+    /// blob is not waiting for an upload.
     pub async fn blob_upload_target(
         &self,
         domain_id: &Id,
@@ -2273,7 +2325,8 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
             ObjectKey {
                 domain_id: *domain_id,
                 object_id: bundle.fact.fact.object_id,
-            },
+            }
+            .staging(),
             size,
         ))
     }

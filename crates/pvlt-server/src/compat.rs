@@ -7,7 +7,9 @@
 //! | delete | `DELETE /api/v1/facts/{id}` | 204, or 404 if there was no such fact |
 //!
 //! Authentication is the `X-OPV-GRANT-TOKEN` header against one static token. It maps to one principal,
-//! `compat`, and one domain. This is deprecated from day one and is the M1 access model.
+//! `compat`, and one domain, and may do only what the policy's `compat` role allows: with no such role it is
+//! refused everything. It can never read a restricted type, because it cannot present a dual-control approval.
+//! This is deprecated from day one and is the M1 access model.
 //!
 //! Differences from OPV, on purpose:
 //! * a fact type other than `ascii`, `printableascii`, `base64` or `json` is a 400 (OPV ships about 55);
@@ -93,7 +95,8 @@ async fn refuse<K: KeyStore, O: ObjectStore, A: Auditor>(
         .await;
 }
 
-/// The static token runs as the policy's `compat` role if it has one, and is allowed everything if not.
+/// The static token runs as the policy's `compat` role, and is refused everything if the policy has none. It can
+/// never present a dual-control approval, so a read of a restricted type is refused.
 async fn compat_authorize<K: KeyStore, O: ObjectStore, A: Auditor>(
     app: &App<K, O, A>,
     action: Action,
@@ -107,6 +110,10 @@ async fn compat_authorize<K: KeyStore, O: ObjectStore, A: Auditor>(
         fact_type: Some(fact_type),
         subject_matches: false,
     }) {
+        Decision::Allow(allowed) if allowed.restricted => {
+            refuse(app, audit_action, fact_id, "approval_required").await;
+            Err(ApiError::Forbidden("approval_required"))
+        }
         Decision::Allow(allowed) => {
             if let Err(e) = crate::v2::rate_limit(app, &allowed, PRINCIPAL, action) {
                 refuse(app, audit_action, fact_id, "rate_limited").await;
@@ -203,17 +210,17 @@ where
 }
 
 #[derive(Serialize)]
-struct Fact {
+struct Fact<'a> {
     id: Uuid,
-    fact_type_slug: String,
-    value: String,
+    fact_type_slug: &'a str,
+    value: &'a str,
 }
 
 async fn read<K, O, A>(
     State(app): State<Arc<App<K, O, A>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<Fact>, ApiError>
+) -> Result<axum::response::Response, ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,
@@ -231,12 +238,13 @@ where
     )
     .await?;
     let fact = app.engine.read_fact(PRINCIPAL, &app.domain, &id).await?;
-    // Every value was a JSON string when it went in, so this holds unless the bucket was tampered with.
-    let value = String::from_utf8(fact.value.to_vec())
-        .map_err(|_| ApiError::Vault(VaultError::OpenFailed))?;
-    Ok(Json(Fact {
+    // Every value was a JSON string when it went in, so this holds unless the bucket was tampered with. Borrowed,
+    // not copied: the value's buffer is wiped when `fact` drops, and the response's when it has been sent.
+    let value =
+        std::str::from_utf8(&fact.value).map_err(|_| ApiError::Vault(VaultError::OpenFailed))?;
+    Ok(crate::secret::json(&Fact {
         id: fact.fact_id,
-        fact_type_slug: fact.fact_type,
+        fact_type_slug: &fact.fact_type,
         value,
     }))
 }

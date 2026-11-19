@@ -71,7 +71,9 @@ Check each of these. Every one is a reason the import fails part way.
    "compat": { "allow": [{ "types": ["ascii", "base64", "json"], "actions": ["create", "read", "shred"] }] }
    ```
 
-   List the types your CSV actually uses. Add a limit back after the import if you want one.
+   List the types your CSV actually uses. Add a limit back after the import if you want one. Without a `compat`
+   role the compat token is refused everything (`403 no_usable_role`). With two or more admins, setting this
+   policy is a request a second admin approves (`POST /v2/admin/changes/{id}/approve`, RUNNING.md).
 5. **The importer host can reach all three listeners**: OPV, pvlt's data listener and pvlt's admin listener. The
    admin listener defaults to `127.0.0.1:8444`, inside the pvlt container or host only. Either run the importer
    there, or bind `PVLT_ADMIN_LISTEN` to a private network that is not published. Check:
@@ -259,7 +261,7 @@ not in the CSV (a different CSV was used with this state file).
 
 ### V3. The key store has every id, active, with the right type
 
-Run against pvlt's database (`PVLT_DATABASE_URL`). The CSV goes into a temporary table in this session only.
+Run against pvlt's database (the URL in `PVLT_DATABASE_URL_FILE`, here in `$PVLT_DATABASE_URL`). The CSV goes into a temporary table in this session only.
 
 ```bash
 psql "$PVLT_DATABASE_URL" -v ON_ERROR_STOP=1 \

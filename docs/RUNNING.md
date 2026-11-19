@@ -19,7 +19,7 @@ All from the environment. A secret is a file named by `NAME_FILE`; a default bui
 
 | Variable | Meaning |
 |---|---|
-| `PVLT_DATABASE_URL` | key store, `postgres://user:pass@host/db`. Migrations run at start. |
+| `PVLT_DATABASE_URL_FILE` | a file holding the key store's URL, `postgres://user:pass@host/db`. Migrations run at start. `PVLT_DATABASE_URL` works too, but a default build refuses it if the URL holds a password. |
 | `PVLT_DOMAIN` | a UUID; the domain every request uses. Created on first write. |
 | `PVLT_S3_BUCKET`, `PVLT_S3_REGION` (`us-east-1`), `PVLT_S3_ENDPOINT` | the data bucket |
 | `PVLT_S3_ACCESS_KEY_ID_FILE`, `PVLT_S3_SECRET_ACCESS_KEY_FILE` | its credentials |
@@ -28,8 +28,8 @@ All from the environment. A secret is a file named by `NAME_FILE`; a default bui
 | `PVLT_TLS_CERT`, `PVLT_TLS_KEY` | PEM files. Required: there is no plaintext listener. The certificate needs the `serverAuth` extended key usage (public CAs issue it; a hand-made one must ask for it). |
 | `PVLT_LISTEN` (`0.0.0.0:8443`) | the data listener, which applications call |
 | `PVLT_ADMIN_LISTEN` (`127.0.0.1:8444`) | admin: unseal, seal, issuers, policy, approvals, audit, import. Keep it on loopback or a private network. |
-| `PVLT_COMPAT_TOKEN_FILE` | the `X-OPV-GRANT-TOKEN` value `/api/v1` clients send. Unset: `/api/v1` refuses everything. |
-| `PVLT_ADMIN_TOKENS_FILE` | named admins, one `name:token` per line (tokens at least 16 characters, names and tokens unique). **Dual control needs two.** |
+| `PVLT_COMPAT_TOKEN_FILE` | the `X-OPV-GRANT-TOKEN` value `/api/v1` clients send, at least 16 characters. Unset, or set with no `compat` role in the policy: `/api/v1` refuses everything. |
+| `PVLT_ADMIN_TOKENS_FILE` | named admins, one `name:token` per line (tokens at least 16 characters, names and tokens unique). **Dual control needs two**, and with two or more, policy and issuer changes need a second admin's approval. |
 | `PVLT_ADMIN_TOKEN_FILE` | a single admin named `admin`, for simple setups |
 | `PVLT_BREAK_GLASS=true` | lets one admin approve their own emergency read, for at most five minutes. Off by default. |
 | `PVLT_GDPR_MODE=true` | serves the data-subject access and export routes (see "GDPR mode" below). Off by default. |
@@ -39,7 +39,7 @@ All from the environment. A secret is a file named by `NAME_FILE`; a default bui
 | `PVLT_PRESIGN_TTL_SECS` (900) | how long a presigned upload or download address lives |
 | `PVLT_EXPIRY_INTERVAL_SECS` (300) | how often expired facts are shredded and unpublished ledger entries retried; 0 turns it off |
 | `PVLT_SWEEP_INTERVAL_SECS` (3600), `PVLT_SWEEP_GRACE_SECS` (3600) | the orphan-object sweeper |
-| `PVLT_SCRATCH_DATABASE_URL` | an empty database, only for `pvlt scrub-backup` |
+| `PVLT_SCRATCH_DATABASE_URL_FILE` | an empty database, only for `pvlt scrub-backup` (or `PVLT_SCRATCH_DATABASE_URL`, with the same password rule) |
 
 **Use a separate ledger bucket.** The ledger is what makes a shred survive restoring an old backup, so it must be
 a bucket that is never restored from a backup, ideally with versioning or object lock. If `PVLT_LEDGER_S3_BUCKET`
@@ -75,9 +75,22 @@ that issuer is registered to assert, and asks the **policy**, which denies by de
 
 ```bash
 pvlt issuer-keygen > issuer.seed            # prints the seed (keep it in the backend), the public key on stderr
-curl --cacert cert.pem -H "Authorization: Bearer $ADMIN" https://localhost:8444/v2/admin/issuers \
-  -d '{"name":"backend","public_key":"<hex>","roles":["verifier","app-backend"]}'      # → {"key_id": 1, ...}
+curl --cacert cert.pem -H "Authorization: Bearer $ALICE" https://localhost:8444/v2/admin/issuers \
+  -d '{"name":"backend","public_key":"<hex>","roles":["verifier","app-backend"]}'   # → 202 {"change_id": ...}
+curl --cacert cert.pem -H "Authorization: Bearer $BOB" https://localhost:8444/v2/admin/changes/<change_id>
+curl --cacert cert.pem -H "Authorization: Bearer $BOB" -X POST \
+  https://localhost:8444/v2/admin/changes/<change_id>/approve                      # → {"result": {"key_id": 1, ...}}
 ```
+
+**Changes to who may do what need two admins.** Registering an issuer, re-enabling one and setting a policy
+decide who can read, so with two or more admins configured each is a request (`202 {"change_id"}`) that a
+*different* admin approves with `POST /v2/admin/changes/{id}/approve` within 24 hours. `GET
+/v2/admin/changes/{id}` shows exactly what will be applied. A policy change is refused at approval if another
+policy landed after it was asked for, so an old request cannot quietly undo a newer one. Disabling an issuer only
+narrows access and takes effect at once. With a single admin the change applies immediately, and the server warns
+at every start that one person can change who reads. Every admin action that changes access, or reads the audit
+log, is written to the audit log first and does not happen if that write fails, so these routes need the domain
+to exist: unseal once before the first one.
 
 A token carries (all inside the part only the issuer can write): `expires` (required, within
 `PVLT_MAX_TOKEN_TTL_SECS`), `request_id`, optionally `caller`, `subject`, `role` (repeatable), `purpose`, `reason`,
@@ -110,18 +123,24 @@ wrong thing), stored in canonical form with its SHA-256 (which every audit entry
 
 `PUT /v2/admin/policy` (admin) replaces it and takes effect at once on that server, and within 30 seconds on
 others. Conditions are `self` (the token's caller is its subject and the fact is filed under that subject) and
-`grant:<name>`. A role named `compat` governs the static `/api/v1` token; without one that token may do anything, so while `PVLT_COMPAT_TOKEN_FILE` is set and the policy has no `compat` role, `/readyz` reports `compat_policy: false` and not ready. The actions are `create`, `read`, `shred` and `rebind`; `DELETE /api/v1/facts/{id}` is `shred`. Subjects are limited to 256 bytes.
+`grant:<name>`. A role named `compat` governs the static `/api/v1` token, and without one that token is refused everything; while `PVLT_COMPAT_TOKEN_FILE` is set and the policy has no `compat` role, `/readyz` also reports `compat_policy: false` and not ready. The compat token can never read a `restricted_types` fact (`403 approval_required`), because it cannot present an approval: release those through `/v2`. The actions are `create`, `read`, `shred` and `rebind`; `DELETE /api/v1/facts/{id}` is `shred`. Subjects are limited to 256 bytes.
 With no policy at all, `/v2` refuses everything.
 
 **Dual control.** Reading a `restricted_types` fact needs an approval: one admin `POST /v2/admin/approvals
-{"fact_id": ...}`, a *different* admin `POST /v2/admin/approvals/{id}/approve`, and the token that reads names it in
-`approval`. It covers one fact, once, for at most 15 minutes (the database enforces two people and single use).
+{"fact_id": ..., "caller": "user:77"}`, a *different* admin `POST /v2/admin/approvals/{id}/approve`, and the token
+that reads names it in `approval` and carries that `caller`. It covers one fact, one caller, once, for at most 15
+minutes (the database enforces two people, the caller and single use), so an approval id that leaks is no use to
+anyone else.
 With `PVLT_BREAK_GLASS=true` a requester may pass `"break_glass": true` and approve alone for at most 5 minutes; that
 is logged at warning level and written to the audit log.
 
-**Rate limits** (`limits` per role, per caller) are counted in memory on each server, so with several servers the
-real limit is up to their number times the configured one, and a restart resets them. A limited request is
-`429` with `Retry-After`.
+**Rate limits** are counted in memory on each server, so with several servers the real limit is up to their number
+times the configured one, and a restart resets them. A limited request is `429` with `Retry-After`. `read_per_hour`
+(and `create_`, `shred_`) count each caller on its own; `total_read_per_hour` (and `total_create_`,
+`total_shred_`) count every caller of the role together. The caller is a claim the issuer writes, so a compromised
+service that invents a caller name per request is held **only by a total**: set one on every role that reads.
+The server warns at start, and when a policy is applied, about roles with a per-caller limit and no total. At most
+600 refusals an hour per issuer reach the audit log; the rest reach the log lines only.
 
 ## The two APIs
 
@@ -196,10 +215,18 @@ which writes a signed marker and an audit entry under the admin's name. Tamperin
 
 ```bash
 pvlt backup-keygen                                    # an age key pair: keep the secret offline
-pvlt backup --out backup.age --recipient age1... [--recipient age1tagpq1...]
-pvlt restore --in backup.age --identity secret.txt    # into an EMPTY key store; replays the ledger
-pvlt scrub-backup --in old.age --identity secret.txt --out new.age --recipient age1...   # needs PVLT_SCRATCH_DATABASE_URL
+pvlt backup-signing-keygen > backup-signing.key       # the backup job's signing key; the public key on stderr
+pvlt backup --out backup.age --recipient age1... [--recipient age1tagpq1...] --signing-key-file backup-signing.key
+pvlt restore --in backup.age --identity secret.txt --verify-key <public hex>   # into an EMPTY key store
+pvlt scrub-backup --in old.age --identity secret.txt --verify-key <hex> \
+  --out new.age --recipient age1... --signing-key-file backup-signing.key   # needs PVLT_SCRATCH_DATABASE_URL_FILE
 ```
+
+Every backup is **signed** by the backup job, and restore refuses one it did not sign. `age` alone proves nothing
+about who made a file, since anyone with the public recipient can encrypt one; without the signature, someone who
+can write to backup storage could have restore load a key store with their own issuer and policy. Keep the
+signing key with the backup job, never with the backups. A backup made before backups were signed restores only
+with `--allow-unsigned` in place of `--verify-key`, which says so loudly.
 
 A backup is the whole key store (wrapped keys, ledger, audit, issuers, policies, approvals), encrypted with `age`
 and written with mode 0600; it is never plaintext. `scrub-backup` rewrites an old backup with everything shredded
@@ -214,10 +241,14 @@ Documents (ID photos, forms) are encrypted by the client and uploaded straight t
 them unless asked to.
 
 1. `POST /v2/blobs {type, scope, subject, size}` → the id, the **key (shown once)**, the layout, and an upload address
-   (a presigned bucket URL, or `/v2/blobs/{id}/object` on the vault if the bucket cannot presign).
+   (a presigned bucket URL, or `/v2/blobs/{id}/object` on the vault if the bucket cannot presign). The address names
+   a staging object, not the one readers get.
 2. The client encrypts with the key (`clients/typescript`) and `PUT`s the object.
-3. `POST /v2/blobs/{id}/complete`: the vault checks the object's exact size and its header's key commitment (it does not
-   read the chunks) and the blob becomes readable.
+3. `POST /v2/blobs/{id}/complete`: the vault copies the staging object to the blob's own object, checks the copy's exact
+   size and its header's key commitment (it does not read the chunks), and the blob becomes readable. An upload
+   address stays valid until it expires, but it can only ever write the staging object again, so nothing uploaded
+   after completion reaches a reader. Complete within `PVLT_SWEEP_GRACE_SECS` of the upload, or the sweeper may
+   remove the staging object first.
 4. `GET /v2/blobs/{id}/access`: the disclosure is written to the audit log, then the key and a download address are
    returned. Or `GET /v2/blobs/{id}/content` has the server decrypt and stream the plaintext; a chunk that fails to
    verify ends the transfer in an error, and the caller must discard what it received.

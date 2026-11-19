@@ -1,0 +1,9 @@
+# Actions and base images are pinned to exact commits and digests; this keeps the pins from going stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
