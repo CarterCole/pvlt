@@ -190,6 +190,15 @@ impl Drop for Files {
     }
 }
 
+/// The backup job's signing key, and what restore is told to trust.
+fn signer() -> backup::SigningKey {
+    backup::SigningKey::from_hex(&"5e".repeat(32)).unwrap()
+}
+
+fn trust() -> backup::Trust {
+    backup::Trust::Signer(signer().public())
+}
+
 fn identity(files: &Files, name: &str) -> (PathBuf, String) {
     let (secret, recipient) = backup::generate_identity();
     let path = files.path(name);
@@ -207,7 +216,7 @@ async fn a_backup_file_is_encrypted_private_and_never_overwritten() {
     let (_, recipient) = identity(&files, "id");
     let out = files.path("backup.age");
 
-    let rows = tools::backup_to_file(&v.store, &out, std::slice::from_ref(&recipient))
+    let rows = tools::backup_to_file(&v.store, &out, std::slice::from_ref(&recipient), &signer())
         .await
         .unwrap();
     assert!(rows > 0);
@@ -228,13 +237,13 @@ async fn a_backup_file_is_encrypted_private_and_never_overwritten() {
     }
     // It will not overwrite a file that is there.
     assert!(
-        tools::backup_to_file(&v.store, &out, &[recipient])
+        tools::backup_to_file(&v.store, &out, &[recipient], &signer())
             .await
             .is_err()
     );
     // And it will not write one without a recipient the server can read.
     assert!(
-        tools::backup_to_file(&v.store, &files.path("none.age"), &[])
+        tools::backup_to_file(&v.store, &files.path("none.age"), &[], &signer())
             .await
             .is_err()
     );
@@ -253,7 +262,7 @@ async fn restoring_a_backup_replays_every_shred_made_since_before_anything_can_r
     let files = Files::new();
     let (identity_file, recipient) = identity(&files, "id");
     let out = files.path("backup.age");
-    tools::backup_to_file(&v.store, &out, &[recipient])
+    tools::backup_to_file(&v.store, &out, &[recipient], &signer())
         .await
         .unwrap();
 
@@ -285,6 +294,7 @@ async fn restoring_a_backup_replays_every_shred_made_since_before_anything_can_r
             &std::fs::read_to_string(&identity_file).unwrap(),
         )
         .unwrap(),
+        &trust(),
     )
     .unwrap();
     fresh.import_all(&dump).await.unwrap();
@@ -306,7 +316,7 @@ async fn restoring_a_backup_replays_every_shred_made_since_before_anything_can_r
         &v.config,
         &v.shares,
     );
-    let report = tools::restore_from_file(&other, &restored2, &out, &identity_file)
+    let report = tools::restore_from_file(&other, &restored2, &out, &identity_file, &trust())
         .await
         .unwrap();
     assert_eq!(report.replayed, 2);
@@ -332,7 +342,7 @@ async fn a_scrubbed_backup_already_has_the_later_shreds_applied() {
     let files = Files::new();
     let (identity_file, recipient) = identity(&files, "id");
     let old = files.path("old.age");
-    tools::backup_to_file(&v.store, &old, std::slice::from_ref(&recipient))
+    tools::backup_to_file(&v.store, &old, std::slice::from_ref(&recipient), &signer())
         .await
         .unwrap();
     v.engine
@@ -353,8 +363,10 @@ async fn a_scrubbed_backup_already_has_the_later_shreds_applied() {
         &scratch_engine,
         &old,
         &identity_file,
+        &trust(),
         &scrubbed,
         &[recipient],
+        &signer(),
     )
     .await
     .unwrap();
@@ -367,6 +379,7 @@ async fn a_scrubbed_backup_already_has_the_later_shreds_applied() {
             &std::fs::read_to_string(&identity_file).unwrap(),
         )
         .unwrap(),
+        &trust(),
     )
     .unwrap();
     let target = dbs.fresh().await;
@@ -405,6 +418,7 @@ async fn a_scrubbed_backup_already_has_the_later_shreds_applied() {
             &std::fs::read_to_string(&identity_file).unwrap(),
         )
         .unwrap(),
+        &trust(),
     )
     .unwrap();
     let old_target = dbs.fresh().await;
@@ -431,14 +445,14 @@ async fn a_wrong_identity_or_a_damaged_file_restores_nothing() {
     let (good, recipient) = identity(&files, "good");
     let (wrong, _) = identity(&files, "wrong");
     let out = files.path("b.age");
-    tools::backup_to_file(&v.store, &out, &[recipient])
+    tools::backup_to_file(&v.store, &out, &[recipient], &signer())
         .await
         .unwrap();
 
     let target = dbs.fresh().await;
     let engine = engine_over(target.clone(), Shared::default(), &v.config, &v.shares);
     assert!(
-        tools::restore_from_file(&target, &engine, &out, &wrong)
+        tools::restore_from_file(&target, &engine, &out, &wrong, &trust())
             .await
             .is_err()
     );
@@ -448,11 +462,23 @@ async fn a_wrong_identity_or_a_damaged_file_restores_nothing() {
     let damaged = files.path("damaged.age");
     std::fs::write(&damaged, &bytes).unwrap();
     assert!(
-        tools::restore_from_file(&target, &engine, &damaged, &good)
+        tools::restore_from_file(&target, &engine, &damaged, &good, &trust())
             .await
             .is_err()
     );
-    // Nothing was loaded by either attempt.
+    // A backup that decrypts fine but that someone else signed, as anyone who knows the public recipient could
+    // make, is refused too.
+    let forged = files.path("forged.age");
+    let other_signer = backup::SigningKey::from_hex(&"0f".repeat(32)).unwrap();
+    let (forged_identity, forged_recipient) = identity(&files, "forged-id");
+    tools::backup_to_file(&v.store, &forged, &[forged_recipient], &other_signer)
+        .await
+        .unwrap();
+    let err = tools::restore_from_file(&target, &engine, &forged, &forged_identity, &trust())
+        .await
+        .unwrap_err();
+    assert_eq!(err.0, "the backup was signed by a different key");
+    // Nothing was loaded by any attempt.
     assert!(tools::must_be_empty(&target).await.is_ok());
     assert!(target.list_domains().await.unwrap().is_empty());
     dbs.finish().await;

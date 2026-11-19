@@ -58,6 +58,7 @@ async fn migrations_are_repeatable_and_make_the_tables() {
         tables,
         [
             "_sqlx_migrations",
+            "admin_changes",
             "approvals",
             "audit",
             "domains",
@@ -1212,6 +1213,85 @@ async fn live_object_ids_names_only_objects_a_reader_could_still_open() {
     assert!(
         w.store()
             .live_object_ids(&seed.domain_id, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    w.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PVLT_TEST_DATABASE_URL; run scripts/test-db.sh start"]
+async fn subject_facts_lists_one_subjects_facts_and_reports_a_subject_shred_on_each() {
+    let w = World::new().await;
+    let seed = w.domain(1).await;
+    let alice = w.person(&seed, "user:alice").await;
+    let bob = w.person(&seed, "user:bob").await;
+    let (a1, _) = fact(&seed, &alice, 1);
+    let (a2, _) = fact(&seed, &alice, 2);
+    let (b1, _) = fact(&seed, &bob, 3);
+    for f in [&a1, &a2, &b1] {
+        w.store().insert_fact(f).await.unwrap();
+    }
+    w.store()
+        .shred_fact(&seed.domain_id, &a2.fact_id)
+        .await
+        .unwrap();
+
+    let list = w
+        .store()
+        .subject_facts(&seed.domain_id, &alice.hmac, 100)
+        .await
+        .unwrap();
+    let mut ids: Vec<_> = list.iter().map(|f| f.fact_id).collect();
+    ids.sort();
+    let mut want = vec![a1.fact_id, a2.fact_id];
+    want.sort();
+    assert_eq!(ids, want, "only alice's facts, shredded ones included");
+    let one = list.iter().find(|f| f.fact_id == a1.fact_id).unwrap();
+    assert_eq!(
+        (one.state, one.fact_type.as_str(), one.legal_hold),
+        (State::Active, a1.fact_type.as_str(), false)
+    );
+    assert!(near_now(one.created_at) && one.shredded_at.is_none());
+    let two = list.iter().find(|f| f.fact_id == a2.fact_id).unwrap();
+    assert_eq!(two.state, State::Shredded);
+    assert!(two.shredded_at.is_some());
+    assert_eq!(
+        w.store()
+            .subject_facts(&seed.domain_id, &alice.hmac, 1)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the limit is applied"
+    );
+
+    // A subject shred leaves the fact rows active but destroys the key: every fact must read as shredded.
+    w.store()
+        .shred_subject_key(&seed.domain_id, &alice.hmac)
+        .await
+        .unwrap();
+    let after = w
+        .store()
+        .subject_facts(&seed.domain_id, &alice.hmac, 100)
+        .await
+        .unwrap();
+    assert!(after.iter().all(|f| f.state == State::Shredded));
+    let bobs = w
+        .store()
+        .subject_facts(&seed.domain_id, &bob.hmac, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        bobs.iter()
+            .map(|f| (f.fact_id, f.state))
+            .collect::<Vec<_>>(),
+        [(b1.fact_id, State::Active)]
+    );
+    assert!(
+        w.store()
+            .subject_facts(&seed.domain_id, &[9; 32], 100)
             .await
             .unwrap()
             .is_empty()

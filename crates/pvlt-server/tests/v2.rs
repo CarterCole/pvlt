@@ -49,6 +49,14 @@ const POLICY: &str = r#"{
   }
 }"#;
 
+/// [`POLICY`] plus a `compat` role, for tests that also call `/api/v1`.
+fn policy_with_compat() -> String {
+    POLICY.replace(
+        "\"app-backend\":",
+        "\"compat\": { \"allow\": [{ \"types\": [\"*\"], \"actions\": [\"create\", \"read\", \"shred\"] }] },\n    \"app-backend\":",
+    )
+}
+
 type Event = (String, Action, Option<Uuid>, &'static str);
 
 #[derive(Default, Clone)]
@@ -139,11 +147,7 @@ async fn rig_with(break_glass: bool, policy: Option<&str>) -> Rig {
         recorder,
     };
     // Register the issuer for the roles a typical service would be allowed to assert, then set the policy.
-    let (status, ..) = call(
-        &rig.admin,
-        Method::POST,
-        "/v2/admin/issuers",
-        Some(ALICE),
+    let (status, ..) = admin2(&rig, Method::POST, "/v2/admin/issuers",
         Some(json!({"name":"backend","public_key":hex::encode(public),"roles":["verifier","data-subject","fulfillment","app-backend"]})),
     )
     .await;
@@ -159,6 +163,7 @@ async fn rig() -> Rig {
     rig_with(false, None).await
 }
 
+/// Sets a policy the way a deployment with two admins does: alice asks, bob approves.
 async fn call_raw_put(r: &Rig, policy: &str) -> (StatusCode, Value, String) {
     let req = Request::builder()
         .method(Method::PUT)
@@ -170,11 +175,47 @@ async fn call_raw_put(r: &Rig, policy: &str) -> (StatusCode, Value, String) {
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    (
-        status,
-        serde_json::from_str(&text).unwrap_or(Value::Null),
-        text,
+    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    approved_by_bob(r, status, body, text).await
+}
+
+/// A change to who may do what, as alice asks for it and bob approves it. Returns what the approval returns
+/// (the change's own result), or the request's answer if it was refused before reaching bob.
+async fn admin2(
+    r: &Rig,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value, String) {
+    let (status, body, text) = call(&r.admin, method, path, Some(ALICE), body).await;
+    approved_by_bob(r, status, body, text).await
+}
+
+async fn approved_by_bob(
+    r: &Rig,
+    status: StatusCode,
+    body: Value,
+    text: String,
+) -> (StatusCode, Value, String) {
+    if status != StatusCode::ACCEPTED {
+        return (status, body, text);
+    }
+    assert_eq!(body["status"], "pending", "{text}");
+    let id = body["change_id"].as_str().unwrap().to_owned();
+    let (status, approved, text) = call(
+        &r.admin,
+        Method::POST,
+        &format!("/v2/admin/changes/{id}/approve"),
+        Some(BOB),
+        None,
     )
+    .await;
+    if status == StatusCode::OK {
+        assert_eq!(approved["status"], "applied", "{text}");
+        (status, approved["result"].clone(), text)
+    } else {
+        (status, approved, text)
+    }
 }
 
 fn claims(roles: &[&str]) -> Claims {
@@ -376,11 +417,10 @@ async fn an_issuer_can_only_assert_the_roles_it_is_registered_for() {
     let r = rig().await;
     let id = create(&r, "u", "identity", "s", "v").await;
     let (seed, public) = generate_issuer_key();
-    let (status, body, _) = call(
-        &r.admin,
+    let (status, body, _) = admin2(
+        &r,
         Method::POST,
         "/v2/admin/issuers",
-        Some(ALICE),
         Some(json!({"name":"marketing","public_key":hex::encode(public),"roles":["app-backend"]})),
     )
     .await;
@@ -427,14 +467,7 @@ async fn disabling_an_issuer_stops_its_tokens_at_once_and_enabling_restores_them
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(get().await.0, StatusCode::UNAUTHORIZED);
-    call(
-        &r.admin,
-        Method::POST,
-        "/v2/admin/issuers/1/enable",
-        Some(ALICE),
-        None,
-    )
-    .await;
+    admin2(&r, Method::POST, "/v2/admin/issuers/1/enable", None).await;
     assert_eq!(get().await.0, StatusCode::OK);
     let (status, ..) = call(
         &r.admin,
@@ -453,27 +486,15 @@ async fn issuer_registration_is_validated_and_names_are_unique() {
     let (_, public) = generate_issuer_key();
     let ok = json!({"name":"second","public_key":hex::encode(public),"roles":[]});
     assert_eq!(
-        call(
-            &r.admin,
-            Method::POST,
-            "/v2/admin/issuers",
-            Some(ALICE),
-            Some(ok.clone())
-        )
-        .await
-        .0,
+        admin2(&r, Method::POST, "/v2/admin/issuers", Some(ok.clone()))
+            .await
+            .0,
         StatusCode::OK
     );
     assert_eq!(
-        call(
-            &r.admin,
-            Method::POST,
-            "/v2/admin/issuers",
-            Some(ALICE),
-            Some(ok)
-        )
-        .await
-        .0,
+        admin2(&r, Method::POST, "/v2/admin/issuers", Some(ok))
+            .await
+            .0,
         StatusCode::CONFLICT
     );
     for bad in [
@@ -484,15 +505,9 @@ async fn issuer_registration_is_validated_and_names_are_unique() {
         json!({"name":"x","public_key":hex::encode(public)}),
     ] {
         assert_eq!(
-            call(
-                &r.admin,
-                Method::POST,
-                "/v2/admin/issuers",
-                Some(ALICE),
-                Some(bad)
-            )
-            .await
-            .0,
+            admin2(&r, Method::POST, "/v2/admin/issuers", Some(bad))
+                .await
+                .0,
             StatusCode::BAD_REQUEST
         );
     }
@@ -778,7 +793,7 @@ async fn a_policy_change_applies_at_once_and_a_bad_policy_changes_nothing() {
 }
 
 #[tokio::test]
-async fn with_no_policy_everything_on_v2_is_denied_and_the_compat_token_still_works() {
+async fn with_no_policy_everything_on_v2_and_on_api_v1_is_denied() {
     let a = Arena::new(256, LockPolicy::BestEffort).unwrap();
     let init = init_shamir(&a, 2, 3).unwrap();
     let ring = Keyring::new(a);
@@ -816,9 +831,10 @@ async fn with_no_policy_everything_on_v2_is_denied_and_the_compat_token_still_wo
             json!({"fact_type_slug":"ascii","scope_custom_id":"s","value":"v"}).to_string(),
         ))
         .unwrap();
+    // The static token is not waved through either: with no `compat` role it may do nothing.
     assert_eq!(
         data.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::OK
+        StatusCode::FORBIDDEN
     );
 }
 
@@ -1009,7 +1025,7 @@ async fn approval_flow(r: &Rig, fact: Uuid) -> Uuid {
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": fact})),
+        Some(json!({"caller": "user:77", "fact_id": fact})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
@@ -1080,7 +1096,7 @@ async fn an_approval_is_for_one_fact_and_a_pending_or_unknown_one_does_not_work(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": two})),
+        Some(json!({"caller": "user:77", "fact_id": two})),
     )
     .await;
     for (name, fact, approval) in [
@@ -1129,7 +1145,7 @@ async fn break_glass_lets_one_admin_approve_alone_only_when_enabled_and_briefly(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": id, "break_glass": true})),
+        Some(json!({"caller": "user:77", "fact_id": id, "break_glass": true})),
     )
     .await;
     assert_eq!(
@@ -1144,7 +1160,7 @@ async fn break_glass_lets_one_admin_approve_alone_only_when_enabled_and_briefly(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": id, "break_glass": true})),
+        Some(json!({"caller": "user:77", "fact_id": id, "break_glass": true})),
     )
     .await;
     assert_eq!(
@@ -1160,7 +1176,7 @@ async fn break_glass_lets_one_admin_approve_alone_only_when_enabled_and_briefly(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": id, "break_glass": true, "ttl_secs": 301})),
+        Some(json!({"caller": "user:77", "fact_id": id, "break_glass": true, "ttl_secs": 301})),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1169,7 +1185,7 @@ async fn break_glass_lets_one_admin_approve_alone_only_when_enabled_and_briefly(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": id, "ttl_secs": 901})),
+        Some(json!({"caller": "user:77", "fact_id": id, "ttl_secs": 901})),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1178,7 +1194,7 @@ async fn break_glass_lets_one_admin_approve_alone_only_when_enabled_and_briefly(
         Method::POST,
         "/v2/admin/approvals",
         Some(ALICE),
-        Some(json!({"fact_id": id, "ttl_secs": 0})),
+        Some(json!({"caller": "user:77", "fact_id": id, "ttl_secs": 0})),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1535,7 +1551,8 @@ async fn admin_actions_are_written_to_the_log_under_the_admins_name() {
         None,
     )
     .await;
-    call(
+    // Re-enabling widens access, so bob only asks and alice approves.
+    let (status, body, _) = call(
         &r.admin,
         Method::POST,
         "/v2/admin/issuers/1/enable",
@@ -1543,6 +1560,17 @@ async fn admin_actions_are_written_to_the_log_under_the_admins_name() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let change = body["change_id"].as_str().unwrap().to_owned();
+    let (status, ..) = call(
+        &r.admin,
+        Method::POST,
+        &format!("/v2/admin/changes/{change}/approve"),
+        Some(ALICE),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     call(
         &r.admin,
         Method::POST,
@@ -1558,13 +1586,20 @@ async fn admin_actions_are_written_to_the_log_under_the_admins_name() {
         .filter(|(k, ..)| k == "admin")
         .map(|(_, p, b)| (p, b["action"].as_str().unwrap().to_owned()))
         .collect();
+    // Every change is on the record twice over: who asked, and who approved and so made it happen.
     for want in [
-        ("alice", "policy.set"),
-        ("alice", "issuer.create"),
+        ("alice", "change.request:policy.set"),
+        ("bob", "change.approve:policy.set"),
+        ("bob", "policy.set"),
+        ("alice", "change.request:issuer.create"),
+        ("bob", "change.approve:issuer.create"),
+        ("bob", "issuer.create"),
         ("alice", "approval.request"),
         ("bob", "approval.approve"),
         ("bob", "issuer.disable"),
-        ("bob", "issuer.enable"),
+        ("bob", "change.request:issuer.enable"),
+        ("alice", "change.approve:issuer.enable"),
+        ("alice", "issuer.enable"),
         ("alice", "legal_hold.set"),
     ] {
         assert!(
@@ -1776,7 +1811,7 @@ async fn a_truncated_audit_log_stops_reads_and_readiness_until_an_admin_acknowle
 
 #[tokio::test]
 async fn when_the_audit_log_is_down_a_v2_read_is_a_503_and_never_a_value() {
-    let r = rig().await;
+    let r = rig_with(false, Some(&policy_with_compat())).await;
     let id = create(&r, "user:1", "identity", "s", SECRET).await;
     r.app.engine.store().set_audit_failure(true);
     let (status, body, text) = read(&r, id, &verifier()).await;
@@ -2350,7 +2385,7 @@ async fn admin_post(r: &Rig, path: &str, body: Value) -> (StatusCode, Value, Str
 
 #[tokio::test]
 async fn an_admin_import_keeps_the_id_and_the_compat_route_reads_it_back() {
-    let r = rig().await;
+    let r = rig_with(false, Some(&policy_with_compat())).await;
     let id = "6f1c2a7e-1111-4222-8333-444455556666";
     let body = json!({"id": id, "subject": "user:7", "scope": "kyc-doc:7", "type": "ascii", "value": SECRET});
     let (status, got, text) = admin_post(&r, "/v2/admin/import/fact", body.clone()).await;
@@ -2430,4 +2465,323 @@ async fn an_admin_import_is_validated_and_needs_the_admin_credential() {
         admin_post(&r, "/v2/admin/import/fact", ok).await.0,
         StatusCode::CREATED
     );
+}
+
+// --- Two-person changes, totals and bound approvals ---------------------------------------------------------------
+
+#[tokio::test]
+async fn one_admin_of_two_cannot_grant_itself_a_reading_role() {
+    let r = rig().await;
+    let id = create(&r, "user:1", "id_number", "kyc:1", SECRET).await;
+    let (seed, public) = generate_issuer_key();
+    // Alice registers a side door: it is only a request.
+    let (status, body, text) = call(
+        &r.admin,
+        Method::POST,
+        "/v2/admin/issuers",
+        Some(ALICE),
+        Some(json!({"name":"side-door","public_key":hex::encode(public),"roles":["reader"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    let issuer_change = body["change_id"].as_str().unwrap().to_owned();
+    let evil = r#"{"version":1,"restricted_types":[],"roles":{"reader":{"allow":[{"types":["*"],"actions":["read"]}]}}}"#;
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/v2/admin/policy")
+        .header("Authorization", format!("Bearer {ALICE}"))
+        .body(Body::from(evil))
+        .unwrap();
+    let res = r.admin.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let policy_change = serde_json::from_slice::<Value>(&bytes).unwrap()["change_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Nothing changed: the issuer is not registered and the old policy is in force.
+    let (_, issuers, _) = call(
+        &r.admin,
+        Method::GET,
+        "/v2/admin/issuers",
+        Some(ALICE),
+        None,
+    )
+    .await;
+    assert_eq!(issuers.as_array().unwrap().len(), 1);
+    let (_, policy, _) = call(&r.admin, Method::GET, "/v2/admin/policy", Some(ALICE), None).await;
+    assert_eq!(policy["policy"]["restricted_types"], json!(["id_number"]));
+
+    // Alice cannot approve her own requests.
+    for change in [&issuer_change, &policy_change] {
+        let (status, body, _) = call(
+            &r.admin,
+            Method::POST,
+            &format!("/v2/admin/changes/{change}/approve"),
+            Some(ALICE),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body["message"].clone()),
+            (StatusCode::FORBIDDEN, json!("approver_is_requester"))
+        );
+    }
+    // Bob sees exactly what he is asked to approve.
+    let (status, shown, _) = call(
+        &r.admin,
+        Method::GET,
+        &format!("/v2/admin/changes/{policy_change}"),
+        Some(BOB),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (
+            shown["kind"].clone(),
+            shown["status"].clone(),
+            shown["requested_by"].clone()
+        ),
+        (json!("policy.set"), json!("pending"), json!("alice"))
+    );
+    assert_eq!(shown["change"]["policy"]["restricted_types"], json!([]));
+
+    // A token from the side door is refused: its issuer was never registered.
+    let t = mint(
+        &seed,
+        &Claims {
+            issuer_key_id: 2,
+            roles: vec!["reader".into()],
+            request_id: "x".into(),
+            expires: now() + 60,
+            ..Claims::default()
+        },
+    )
+    .unwrap();
+    let (status, _, text) = call(
+        &r.data,
+        Method::GET,
+        &format!("/v2/facts/{id}"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!text.contains(SECRET));
+}
+
+#[tokio::test]
+async fn an_approved_policy_change_is_refused_if_another_landed_first() {
+    let r = rig().await;
+    let ask = |policy: String| {
+        let admin = r.admin.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri("/v2/admin/policy")
+                .header("Authorization", format!("Bearer {ALICE}"))
+                .body(Body::from(policy))
+                .unwrap();
+            let res = admin.oneshot(req).await.unwrap();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&bytes).unwrap()["change_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let first = ask(POLICY.replace("1000", "10")).await;
+    let second = ask(POLICY.replace("1000", "20")).await;
+    let approve = |id: String| {
+        let admin = r.admin.clone();
+        async move {
+            call(
+                &admin,
+                Method::POST,
+                &format!("/v2/admin/changes/{id}/approve"),
+                Some(BOB),
+                None,
+            )
+            .await
+        }
+    };
+    assert_eq!(approve(second).await.0, StatusCode::OK);
+    // The first was asked for against the old policy; approving it now would silently undo the second.
+    let (status, ..) = approve(first.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, shown, _) = call(
+        &r.admin,
+        Method::GET,
+        &format!("/v2/admin/changes/{first}"),
+        Some(BOB),
+        None,
+    )
+    .await;
+    assert_eq!(
+        shown["status"], "pending",
+        "a refused approval does not spend the change"
+    );
+}
+
+#[tokio::test]
+async fn a_total_holds_an_issuer_that_rotates_the_caller_claim() {
+    let policy = POLICY.replace(
+        "\"read_per_hour\": 1000",
+        "\"read_per_hour\": 2, \"total_read_per_hour\": 5",
+    );
+    let r = rig_with(false, Some(&policy)).await;
+    let id = create(&r, "user:1", "identity", "kyc:1", SECRET).await;
+    let mut ok = 0;
+    for i in 0..50 {
+        let c = Claims {
+            caller: Some(format!("user:rotated-{i}")),
+            ..verifier()
+        };
+        match read(&r, id, &c).await.0 {
+            StatusCode::OK => ok += 1,
+            StatusCode::TOO_MANY_REQUESTS => {}
+            other => panic!("{other}"),
+        }
+    }
+    assert_eq!(ok, 5, "fifty caller names still share one total");
+}
+
+#[tokio::test]
+async fn an_approval_works_only_for_the_caller_it_names() {
+    let r = rig().await;
+    let id = create(&r, "user:1", "id_number", "kyc-doc:1", "X-123-456").await;
+    let approval = approval_flow(&r, id).await;
+    // Someone else who learns the approval id, with a role that may read the type, cannot use it.
+    let other = Claims {
+        caller: Some("user:78".into()),
+        approval: Some(approval.to_string()),
+        ..verifier()
+    };
+    let (status, body, text) = read(&r, id, &other).await;
+    assert_eq!(
+        (status, body["message"].clone()),
+        (StatusCode::FORBIDDEN, json!("approval_invalid"))
+    );
+    assert!(!text.contains("X-123-456"));
+    // Nor can a token with no caller at all.
+    let anonymous = Claims {
+        caller: None,
+        approval: Some(approval.to_string()),
+        ..verifier()
+    };
+    assert_eq!(read(&r, id, &anonymous).await.0, StatusCode::FORBIDDEN);
+    // The caller it names still can, once: the failed attempts did not spend it.
+    let named = Claims {
+        approval: Some(approval.to_string()),
+        ..verifier()
+    };
+    let (status, body, _) = read(&r, id, &named).await;
+    assert_eq!(
+        (status, body["value"].clone()),
+        (StatusCode::OK, json!("X-123-456"))
+    );
+    // An approval request must name its caller.
+    let (status, ..) = call(
+        &r.admin,
+        Method::POST,
+        "/v2/admin/approvals",
+        Some(ALICE),
+        Some(json!({"fact_id": id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn refusals_of_valid_tokens_reach_the_audit_log_at_a_bounded_rate() {
+    let r = rig().await;
+    let id = create(&r, "user:1", "identity", "kyc:1", SECRET).await;
+    // A token with no usable role, sent again and again.
+    let t = token(
+        &r,
+        &Claims {
+            caller: Some("user:flood".into()),
+            ..claims(&["nobody"])
+        },
+    );
+    for _ in 0..650 {
+        let (status, ..) = call(
+            &r.data,
+            Method::GET,
+            &format!("/v2/facts/{id}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let denials = audit_rows(&r)
+        .await
+        .into_iter()
+        .filter(|(k, ..)| k == "deny")
+        .count();
+    assert_eq!(denials, 600, "the audit log took 600 refusals and no more");
+    // Every one still reached the log lines.
+    let logged = r
+        .recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.3 == "no_usable_role")
+        .count();
+    assert_eq!(logged, 650);
+}
+
+#[tokio::test]
+async fn an_admin_change_that_cannot_be_audited_does_not_happen() {
+    let r = rig().await;
+    let (_, before, _) = call(&r.admin, Method::GET, "/v2/admin/policy", Some(ALICE), None).await;
+    r.app.engine.store().set_audit_failure(true);
+    let tighter = POLICY.replace("1000", "1");
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/v2/admin/policy")
+        .header("Authorization", format!("Bearer {ALICE}"))
+        .body(Body::from(tighter))
+        .unwrap();
+    assert_eq!(
+        r.admin.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let (_, public) = generate_issuer_key();
+    let (status, ..) = call(
+        &r.admin,
+        Method::POST,
+        "/v2/admin/issuers",
+        Some(ALICE),
+        Some(json!({"name":"unrecorded","public_key":hex::encode(public),"roles":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, ..) = call(
+        &r.admin,
+        Method::POST,
+        "/v2/admin/issuers/1/disable",
+        Some(ALICE),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    r.app.engine.store().set_audit_failure(false);
+    // Nothing changed while the log was down.
+    let (_, after, _) = call(&r.admin, Method::GET, "/v2/admin/policy", Some(ALICE), None).await;
+    assert_eq!(before, after);
+    let (_, issuers, _) = call(
+        &r.admin,
+        Method::GET,
+        "/v2/admin/issuers",
+        Some(ALICE),
+        None,
+    )
+    .await;
+    assert_eq!(issuers.as_array().unwrap().len(), 1);
+    assert_eq!(issuers[0]["enabled"], json!(true));
 }

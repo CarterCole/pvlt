@@ -220,13 +220,64 @@ pub enum SealMode {
     Passphrase(PassphraseParams),
 }
 
-/// What a key store persists about sealing. It contains no secret: the wrapped root key is ciphertext.
+/// What a key store persists about sealing. It contains no secret: the wrapped root key is ciphertext, and a
+/// share check is a hash of a share that cannot be turned back into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealConfig {
     /// The root key, wrapped by the unseal key.
     pub root: WrappedRoot,
     /// How the unseal key is held.
     pub mode: SealMode,
+    /// For each share made at `init`, its number and [`share_check`] value, so a share can be checked on its own
+    /// the moment it arrives and a forged or foreign one refused before it can spoil an unseal. Empty for a
+    /// vault initialised before checks were recorded, or sealed another way.
+    pub share_checks: Vec<(u8, [u8; 32])>,
+}
+
+/// `SHA-256(PREFIX ‖ "share-commit" ‖ 0x00 ‖ root_key_id ‖ x ‖ y)`: commits to one share. Every share is
+/// 32 bytes of a random polynomial's value, so the hash reveals nothing a guesser could use, and fewer than
+/// `threshold` shares plus every check still leave the unseal key at full strength.
+pub fn share_check(root_key_id: &Id, index: u8, y: &Key) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(PREFIX)
+        .chain_update(b"share-commit\0")
+        .chain_update(root_key_id)
+        .chain_update([index])
+        .chain_update(y)
+        .finalize()
+        .into()
+}
+
+/// Checks one share against the vault's seal configuration: right vault, right threshold, and (when the
+/// configuration recorded them) the exact share that was dealt under that number. Fails with
+/// [`VaultError::Invalid`] and a fixed reason.
+pub fn check_share(config: &SealConfig, share: &UnsealShare) -> Result<ShareInfo, VaultError> {
+    let Parts { info, y } = share.parts()?;
+    if info.root_key_id != config.root.id {
+        return Err(VaultError::Invalid("share is for a different root key"));
+    }
+    if let SealMode::Shamir { threshold, .. } = &config.mode
+        && info.threshold != *threshold
+    {
+        return Err(VaultError::Invalid(
+            "share was made for a different threshold",
+        ));
+    }
+    if !config.share_checks.is_empty() {
+        let want = config
+            .share_checks
+            .iter()
+            .find(|(x, _)| *x == info.index)
+            .map(|(_, h)| h)
+            .ok_or(VaultError::Invalid("no share with this number was dealt"))?;
+        let got = share_check(&config.root.id, info.index, &y);
+        if !bool::from(got.ct_eq(want)) {
+            return Err(VaultError::Invalid(
+                "this is not the share that was dealt under this number",
+            ));
+        }
+    }
+    Ok(info)
 }
 
 /// The result of creating a vault's root key.
@@ -331,10 +382,17 @@ pub fn init_shamir(arena: &Arena, threshold: u8, shares: u8) -> Result<Initializ
         }
     }
 
+    let mut share_checks = Vec::with_capacity(dealt.len());
+    for share in &dealt {
+        let Parts { info, y } = share.parts()?;
+        share_checks.push((info.index, share_check(root.id(), info.index, &y)));
+    }
+
     Ok(Initialized {
         config: SealConfig {
             root: wrapped,
             mode: SealMode::Shamir { threshold, shares },
+            share_checks,
         },
         shares: dealt,
         root,
@@ -356,6 +414,9 @@ pub fn unseal_with_shares(
             return Err(VaultError::Invalid("this vault is not sealed with shares"));
         }
     };
+    for share in shares {
+        check_share(config, share)?;
+    }
     let unseal = recover_unseal_key(threshold, &config.root.id, shares)?;
     RootKey::unwrap(arena, &unseal, &config.root)
 }
@@ -394,6 +455,7 @@ pub fn init_passphrase(
         config: SealConfig {
             root: wrapped,
             mode: SealMode::Passphrase(params),
+            share_checks: Vec::new(),
         },
         shares: Vec::new(),
         root,
@@ -461,10 +523,42 @@ mod tests {
         );
     }
 
+    /// The configuration of a vault initialised before share checks were recorded.
+    fn without_checks(config: &SealConfig) -> SealConfig {
+        SealConfig {
+            share_checks: Vec::new(),
+            ..config.clone()
+        }
+    }
+
+    #[test]
+    fn a_forged_share_is_refused_on_its_own_by_its_check() {
+        let a = arena();
+        let init = init_shamir(&a, 3, 5).unwrap();
+        assert_eq!(init.config.share_checks.len(), 5);
+        for share in &init.shares {
+            assert_eq!(
+                check_share(&init.config, share).unwrap(),
+                share.info().unwrap()
+            );
+        }
+        let bad = forged(&init.shares[0]);
+        assert_eq!(
+            check_share(&init.config, &bad).unwrap_err(),
+            VaultError::Invalid("this is not the share that was dealt under this number")
+        );
+        let shares = [bad, copy(&init.shares[1]), copy(&init.shares[2])];
+        assert_eq!(
+            unseal_with_shares(&a, &init.config, &shares).unwrap_err(),
+            VaultError::Invalid("this is not the share that was dealt under this number")
+        );
+    }
+
     #[test]
     fn two_shares_with_one_number_and_different_contents_are_refused() {
         let a = arena();
         let init = init_shamir(&a, 3, 5).unwrap();
+        let config = without_checks(&init.config);
         let shares = [
             copy(&init.shares[0]),
             forged(&init.shares[0]),
@@ -472,7 +566,7 @@ mod tests {
             copy(&init.shares[2]),
         ];
         assert_eq!(
-            unseal_with_shares(&a, &init.config, &shares).unwrap_err(),
+            unseal_with_shares(&a, &config, &shares).unwrap_err(),
             VaultError::Invalid("two shares have the same number but different contents")
         );
     }
@@ -481,6 +575,8 @@ mod tests {
     fn a_wrong_share_can_never_produce_a_wrong_root_key() {
         let a = arena();
         let init = init_shamir(&a, 3, 5).unwrap();
+        // Without checks (an older vault) the forged share is only caught when the root key fails to open.
+        let config = without_checks(&init.config);
         let shares = [
             forged(&init.shares[0]),
             copy(&init.shares[1]),
@@ -488,7 +584,7 @@ mod tests {
         ];
         // The shares combine to some other unseal key, which then fails to open the wrapped root key.
         assert_eq!(
-            unseal_with_shares(&a, &init.config, &shares).unwrap_err(),
+            unseal_with_shares(&a, &config, &shares).unwrap_err(),
             VaultError::OpenFailed
         );
     }

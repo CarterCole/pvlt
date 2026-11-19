@@ -70,6 +70,9 @@ pub enum Kind {
     Deny,
     /// An admin-listener action.
     Admin,
+    /// The list of a subject's facts (ids, types, dates, no values) is about to be disclosed, for a data-subject
+    /// access request. Written before the list is sent, like a read grant.
+    Inventory,
 }
 
 impl Kind {
@@ -83,6 +86,7 @@ impl Kind {
             Kind::Rebind => "rebind",
             Kind::Deny => "deny",
             Kind::Admin => "admin",
+            Kind::Inventory => "inventory",
         }
     }
 
@@ -96,6 +100,7 @@ impl Kind {
             "rebind" => Kind::Rebind,
             "deny" => Kind::Deny,
             "admin" => Kind::Admin,
+            "inventory" => Kind::Inventory,
             _ => return None,
         })
     }

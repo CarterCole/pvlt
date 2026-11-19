@@ -287,6 +287,27 @@ pub struct DueFact {
     pub object_id: Id,
 }
 
+/// A fact filed under a subject, as listed for a data-subject access request. Holds no key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectFact {
+    /// The fact id.
+    pub fact_id: FactId,
+    /// The fact type.
+    pub fact_type: String,
+    /// A fact or a blob.
+    pub kind: FactKind,
+    /// Shredded if the fact, the subject key that wraps it, or the domain was shredded.
+    pub state: State,
+    /// When it was created.
+    pub created_at: OffsetDateTime,
+    /// When it expires, if it does.
+    pub expires_at: Option<OffsetDateTime>,
+    /// Whether it is under legal hold.
+    pub legal_hold: bool,
+    /// When the fact row itself was shredded. A fact destroyed by a subject or domain shred has no time here.
+    pub shredded_at: Option<OffsetDateTime>,
+}
+
 /// A registered token issuer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuerRecord {
@@ -334,6 +355,9 @@ pub struct ApprovalRecord {
     pub expires_at: OffsetDateTime,
     /// It has been used. It can be used once.
     pub used: bool,
+    /// The only caller (a token's `caller` claim) who may use it. `None` only for approvals made before this
+    /// was recorded, which no token can use.
+    pub reader: Option<String>,
 }
 
 /// An approval to create.
@@ -350,6 +374,42 @@ pub struct NewApproval {
     /// Approve it at once, by the requester (break-glass).
     pub break_glass: bool,
     /// When it stops being useful.
+    pub expires_at: OffsetDateTime,
+    /// The only caller (a token's `caller` claim) who may use it.
+    pub reader: String,
+}
+
+/// A change to who may do what (a new policy, a new issuer, re-enabling an issuer) that one admin asked for and
+/// a second must approve before it takes effect. The store keeps it and enforces "two people, once, in time";
+/// what the payload means is the server's business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminChangeRecord {
+    /// Its id.
+    pub id: Uuid,
+    /// What kind of change, such as `policy.set`.
+    pub kind: String,
+    /// The change itself, as the requester sent it after validation.
+    pub payload: Vec<u8>,
+    /// The admin who asked.
+    pub requested_by: String,
+    /// The admin who approved: always a different one.
+    pub approved_by: Option<String>,
+    /// After this it cannot be approved.
+    pub expires_at: OffsetDateTime,
+}
+
+/// An admin change to record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAdminChange {
+    /// Its id.
+    pub id: Uuid,
+    /// What kind of change.
+    pub kind: String,
+    /// The change.
+    pub payload: Vec<u8>,
+    /// The admin asking.
+    pub requested_by: String,
+    /// When it can no longer be approved.
     pub expires_at: OffsetDateTime,
 }
 
@@ -620,6 +680,15 @@ pub trait KeyStore: Send + Sync {
         scope_hmac: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<(FactId, Id)>, StoreError>> + Send;
 
+    /// Every fact filed under a subject, shredded ones included, oldest first, at most `limit`. Used to answer
+    /// a data-subject access request (GDPR art. 15) without opening any value.
+    fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject_hmac: &[u8; 32],
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<SubjectFact>, StoreError>> + Send;
+
     /// The active key versions of a subject, and the bik version it was made with.
     fn subject_active_versions(
         &self,
@@ -705,15 +774,38 @@ pub trait KeyStore: Send + Sync {
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<ApprovalRecord, StoreError>> + Send;
 
-    /// Uses an approval, once: it must be approved, unused, unexpired at `now`, and for this fact in this
-    /// domain. Any other case is [`StoreError::Conflict`], and a second use fails.
+    /// Uses an approval, once: it must be approved, unused, unexpired at `now`, for this fact in this domain,
+    /// and made out to this `caller`. Any other case is [`StoreError::Conflict`], and a second use fails.
     fn consume_approval(
         &self,
         domain_id: &Id,
         id: &Uuid,
         fact_id: &FactId,
+        caller: &str,
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Records an admin change waiting for a second admin. [`StoreError::AlreadyExists`] if the id is taken.
+    fn create_admin_change(
+        &self,
+        new: &NewAdminChange,
+    ) -> impl Future<Output = Result<AdminChangeRecord, StoreError>> + Send;
+
+    /// An admin change. [`StoreError::NotFound`] if there is none.
+    fn admin_change(
+        &self,
+        id: &Uuid,
+    ) -> impl Future<Output = Result<AdminChangeRecord, StoreError>> + Send;
+
+    /// Approves an admin change as `approver`, once: it must not be approved yet, must not have expired at
+    /// `now`, and `approver` must not be its requester. [`StoreError::Conflict`] otherwise. The caller applies the
+    /// change after this returns; a change that then fails to apply is spent and has to be asked for again.
+    fn approve_admin_change(
+        &self,
+        id: &Uuid,
+        approver: &str,
+        now: OffsetDateTime,
+    ) -> impl Future<Output = Result<AdminChangeRecord, StoreError>> + Send;
 
     /// The newest audit entry of a domain, or `None` if the log is empty.
     fn audit_head(

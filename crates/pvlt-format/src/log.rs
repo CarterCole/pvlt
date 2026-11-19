@@ -221,6 +221,20 @@ pub fn checkpoint_verify(
     verify(public, &signed_message(b"checkpoint", &digest), sig_hex)
 }
 
+/// Signs a key-store backup: `Ed25519(key, PREFIX ‖ "backup-sig" ‖ 0x00 ‖ digest)`, where `digest` is the
+/// SHA-256 of the backup's body. The signing key belongs to whoever takes backups, not to the vault, so a backup
+/// can be signed without unsealing and checked without the vault's keys.
+pub fn backup_sign(seed: &Key, digest: &[u8; 32]) -> [u8; 64] {
+    SigningKey::from_bytes(seed)
+        .sign(&signed_message(b"backup-sig", digest))
+        .to_bytes()
+}
+
+/// Verifies a backup signature given as hex.
+pub fn backup_verify(public: &[u8; 32], digest: &[u8; 32], sig_hex: &str) -> Result<(), Error> {
+    verify(public, &signed_message(b"backup-sig", digest), sig_hex)
+}
+
 /// Checks `seq` and `prev` for a run of entries starting at `seq` 0, and returns the head hash.
 pub fn verify_chain(entries: &[Value]) -> Result<[u8; 32], Error> {
     let mut prev = ZERO_HASH.to_owned();

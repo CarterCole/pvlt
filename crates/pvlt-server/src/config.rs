@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::GdprMode;
 use crate::bucket::S3Config;
 use pvlt_format::Id;
 use uuid::Uuid;
@@ -61,6 +62,9 @@ pub struct Config {
     pub sweep_interval: Option<Duration>,
     /// How old an unkeyed object must be before the sweeper may delete it.
     pub sweep_grace: Duration,
+    /// GDPR mode and which of its parts are on (`PVLT_GDPR_MODE`, `PVLT_GDPR_EXPORT`,
+    /// `PVLT_GDPR_ADMIN_INVENTORY`).
+    pub gdpr: GdprMode,
     /// A plaintext data listener. Development builds only.
     #[cfg(feature = "dev-insecure")]
     pub insecure_listen: Option<SocketAddr>,
@@ -150,6 +154,24 @@ impl Env {
         Ok(None)
     }
 
+    /// A Postgres connection URL: from `NAME_FILE`, or from `NAME` itself if it carries no password (one that
+    /// uses a client certificate, a `.pgpass` file or peer authentication). A default build refuses a password
+    /// in the variable, where it would show up in the process environment and in `docker inspect`.
+    pub fn database_url(&self, name: &str) -> Result<Option<String>, ConfigError> {
+        let file_var = format!("{name}_FILE");
+        if self.get(&file_var).is_some() {
+            return self.secret(name);
+        }
+        match self.get(name) {
+            None => Ok(None),
+            Some(url) if INSECURE || !url_has_password(url) => Ok(Some(url.to_owned())),
+            Some(_) => Err(bad(format!(
+                "{name} holds a password, which this build does not take from a variable; put the URL in a \
+                 file and set {file_var}"
+            ))),
+        }
+    }
+
     /// An S3 bucket's settings from `<prefix>_BUCKET`, `_REGION`, `_ENDPOINT`, `_ACCESS_KEY_ID(_FILE)`,
     /// `_SECRET_ACCESS_KEY(_FILE)`, `_ALLOW_HTTP` and `_PATH_STYLE`. `None` if `<prefix>_BUCKET` is unset.
     fn s3(&self, prefix: &str) -> Result<Option<S3Config>, ConfigError> {
@@ -193,12 +215,39 @@ impl Env {
     }
 
     fn flag(&self, name: &str) -> Result<bool, ConfigError> {
+        self.flag_or(name, false)
+    }
+
+    fn flag_or(&self, name: &str, default: bool) -> Result<bool, ConfigError> {
         match self.get(name) {
-            None | Some("0" | "false") => Ok(false),
+            None => Ok(default),
+            Some("0" | "false") => Ok(false),
             Some("1" | "true") => Ok(true),
             Some(_) => Err(bad(format!("{name} must be true or false"))),
         }
     }
+}
+
+const INSECURE: bool = cfg!(feature = "dev-insecure");
+
+/// The shortest static token accepted: the compat token and every admin token.
+pub const MIN_TOKEN_LEN: usize = 16;
+
+/// Whether a Postgres connection URL carries a password, in its user info (`user:password@`) or as a
+/// `password=` parameter.
+pub fn url_has_password(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..authority_end).unwrap_or(rest);
+    let in_userinfo = authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'));
+    let in_query = rest.split_once('?').is_some_and(|(_, q)| {
+        q.split(['&', '#'])
+            .filter_map(|kv| kv.split('=').next())
+            .any(|k| k.eq_ignore_ascii_case("password"))
+    });
+    in_userinfo || in_query
 }
 
 /// Reads the administrators. Names must be unique and plain, and no two admins may share a token: dual control
@@ -237,7 +286,7 @@ fn admins(env: &Env) -> Result<Vec<(String, String)>, ConfigError> {
                 "an admin name must be 1 to 64 letters, digits, - _ or .",
             ));
         }
-        if token.len() < 16 {
+        if token.len() < MIN_TOKEN_LEN {
             return Err(bad("an admin token must be at least 16 characters"));
         }
     }
@@ -306,16 +355,25 @@ impl Config {
         let max_value_len = usize::try_from(env.number("PVLT_MAX_VALUE_BYTES", 1_048_576)?)
             .map_err(|_| bad("PVLT_MAX_VALUE_BYTES is too large"))?;
         let sweep_secs = env.number("PVLT_SWEEP_INTERVAL_SECS", 3600)?;
+        let compat_token = env.secret("PVLT_COMPAT_TOKEN")?;
+        if compat_token
+            .as_ref()
+            .is_some_and(|t| t.len() < MIN_TOKEN_LEN)
+        {
+            return Err(bad("the compat token must be at least 16 characters"));
+        }
 
         Ok(Self {
-            database_url: env.require("PVLT_DATABASE_URL")?.to_owned(),
+            database_url: env
+                .database_url("PVLT_DATABASE_URL")?
+                .ok_or_else(|| bad("PVLT_DATABASE_URL_FILE or PVLT_DATABASE_URL is required"))?,
             listen: env.addr("PVLT_LISTEN", "0.0.0.0:8443")?,
             admin_listen: env.addr("PVLT_ADMIN_LISTEN", "127.0.0.1:8444")?,
             tls,
             storage,
             ledger_storage,
             domain,
-            compat_token: env.secret("PVLT_COMPAT_TOKEN")?,
+            compat_token,
             admins: admins(env)?,
             max_token_ttl: i64::try_from(env.number("PVLT_MAX_TOKEN_TTL_SECS", 300)?)
                 .map_err(|_| bad("PVLT_MAX_TOKEN_TTL_SECS is too large"))?,
@@ -331,6 +389,11 @@ impl Config {
             },
             sweep_interval: (sweep_secs > 0).then(|| Duration::from_secs(sweep_secs)),
             sweep_grace: Duration::from_secs(env.number("PVLT_SWEEP_GRACE_SECS", 3600)?),
+            gdpr: GdprMode {
+                enabled: env.flag("PVLT_GDPR_MODE")?,
+                export: env.flag_or("PVLT_GDPR_EXPORT", true)?,
+                admin_inventory: env.flag_or("PVLT_GDPR_ADMIN_INVENTORY", true)?,
+            },
             #[cfg(feature = "dev-insecure")]
             insecure_listen,
         })
@@ -377,7 +440,7 @@ mod tests {
     /// A complete, valid set of settings.
     fn base(files: &Files) -> Vec<(String, String)> {
         [
-            ("PVLT_DATABASE_URL", "postgres://u:p@h/db".to_owned()),
+            ("PVLT_DATABASE_URL", "postgres://u@h/db".to_owned()),
             ("PVLT_DOMAIN", DOMAIN.to_owned()),
             ("PVLT_S3_BUCKET", "b".to_owned()),
             ("PVLT_S3_ACCESS_KEY_ID_FILE", files.path("key-id")),
@@ -468,9 +531,96 @@ mod tests {
         assert!(err.0.contains("empty"), "{err}");
     }
 
+    #[test]
+    fn gdpr_mode_is_off_by_default_and_its_intrusive_parts_can_be_turned_off_one_by_one() {
+        let f = Files::new("gdpr");
+        let off = Config::load(&env(&base(&f))).unwrap().gdpr;
+        assert!(!off.enabled && !off.export_enabled() && !off.admin_inventory_enabled());
+
+        let on = Config::load(&env(&with(base(&f), "PVLT_GDPR_MODE", "true")))
+            .unwrap()
+            .gdpr;
+        assert_eq!(on, GdprMode::on());
+
+        let pairs = with(
+            with(base(&f), "PVLT_GDPR_MODE", "true"),
+            "PVLT_GDPR_ADMIN_INVENTORY",
+            "false",
+        );
+        let pairs = with(pairs, "PVLT_GDPR_EXPORT", "0");
+        let narrow = Config::load(&env(&pairs)).unwrap().gdpr;
+        assert!(narrow.enabled && !narrow.export_enabled() && !narrow.admin_inventory_enabled());
+
+        let err = Config::load(&env(&with(base(&f), "PVLT_GDPR_MODE", "yes"))).unwrap_err();
+        assert!(err.0.contains("PVLT_GDPR_MODE"), "{err}");
+    }
+
+    #[test]
+    fn a_password_in_a_connection_url_is_found() {
+        for with in [
+            "postgres://u:p@h/db",
+            "postgresql://u:p%40ss@h:5432/db?sslmode=verify-full",
+            "postgres://u@h/db?sslmode=require&password=x",
+            "postgres://u@h/db?PASSWORD=x",
+        ] {
+            assert!(url_has_password(with), "{with}");
+        }
+        for without in [
+            "postgres://u@h/db",
+            "postgres://h/db",
+            "postgres://u@h/db?sslmode=verify-full&sslcert=/c.pem",
+            // A colon after the host is a port, not a password.
+            "postgres://u@h:5432/db",
+            "postgres://h:5432/db?application_name=a:b",
+        ] {
+            assert!(!url_has_password(without), "{without}");
+        }
+    }
+
+    #[test]
+    fn the_database_url_comes_from_a_file_with_its_password() {
+        let f = Files::new("db");
+        std::fs::write(f.0.join("db-url"), "postgres://u:secret@h/db\n").unwrap();
+        let pairs = with(
+            without(base(&f), "PVLT_DATABASE_URL"),
+            "PVLT_DATABASE_URL_FILE",
+            &f.path("db-url"),
+        );
+        assert_eq!(
+            Config::load(&env(&pairs)).unwrap().database_url,
+            "postgres://u:secret@h/db"
+        );
+        let err = Config::load(&env(&without(base(&f), "PVLT_DATABASE_URL"))).unwrap_err();
+        assert!(err.0.contains("PVLT_DATABASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn a_short_compat_token_is_refused() {
+        let f = Files::new("compat");
+        std::fs::write(f.0.join("compat"), "short\n").unwrap();
+        let pairs = with(base(&f), "PVLT_COMPAT_TOKEN_FILE", &f.path("compat"));
+        let err = Config::load(&env(&pairs)).unwrap_err();
+        assert!(
+            err.0.contains("compat token") && !err.0.contains("short"),
+            "{err}"
+        );
+    }
+
     #[cfg(not(feature = "dev-insecure"))]
     #[test]
     fn a_default_build_refuses_secrets_in_variables_and_a_local_directory() {
+        let f = Files::new("pw");
+        let err = Config::load(&env(&with(
+            base(&f),
+            "PVLT_DATABASE_URL",
+            "postgres://u:hunter2@h/db",
+        )))
+        .unwrap_err();
+        assert!(
+            err.0.contains("PVLT_DATABASE_URL_FILE") && !err.0.contains("hunter2"),
+            "{err}"
+        );
+
         let f = Files::new("strict");
         let err =
             Config::load(&env(&with(base(&f), "PVLT_COMPAT_TOKEN", "abc-token"))).unwrap_err();
@@ -495,10 +645,10 @@ mod tests {
     #[test]
     fn a_dev_build_accepts_a_variable_a_directory_and_a_plaintext_listener() {
         let f = Files::new("dev");
-        let pairs = with(base(&f), "PVLT_COMPAT_TOKEN", "abc-token");
+        let pairs = with(base(&f), "PVLT_COMPAT_TOKEN", "abc-token-0123456789");
         assert_eq!(
             Config::load(&env(&pairs)).unwrap().compat_token.as_deref(),
-            Some("abc-token")
+            Some("abc-token-0123456789")
         );
         let dev = with(
             with(without(base(&f), "PVLT_TLS"), "PVLT_DATA_DIR", "/tmp/x"),

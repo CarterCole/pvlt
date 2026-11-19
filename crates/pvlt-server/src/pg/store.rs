@@ -5,10 +5,11 @@ use pvlt_core::keys::{
 };
 use pvlt_core::seal::{SealConfig, SealMode};
 use pvlt_core::store::{
-    ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed, DomainRecord,
-    DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore, LedgerAppend,
-    LedgerHead, LedgerRecord, NewApproval, NewFact, NewSubjectKey, PolicyRecord, ReplayEffect,
-    ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectKeyRecord,
+    AdminChangeRecord, ApprovalRecord, AuditAppend, AuditFilter, AuditRecord, BlobInfo, Destroyed,
+    DomainRecord, DueFact, FactBundle, FactId, FactKind, FactRecord, IssuerRecord, KeyStore,
+    LedgerAppend, LedgerHead, LedgerRecord, NewAdminChange, NewApproval, NewFact, NewSubjectKey,
+    PolicyRecord, ReplayEffect, ShredFact, ShredPlan, ShredSubject, State, StoreError, SubjectFact,
+    SubjectKeyRecord,
 };
 use pvlt_format::Id;
 use pvlt_format::wrap::SignPurpose;
@@ -206,6 +207,7 @@ fn seal_config_from(row: &PgRow) -> Result<SealConfig, StoreError> {
             wrapped: get(row, "wrapped_root")?,
         },
         mode,
+        share_checks: share_checks_from_bytes(get(row, "shamir_share_checks")?)?,
     })
 }
 
@@ -472,7 +474,56 @@ fn approval_from(row: &PgRow) -> Result<ApprovalRecord, StoreError> {
         break_glass: get(row, "break_glass")?,
         expires_at: get(row, "expires_at")?,
         used: get::<Option<OffsetDateTime>>(row, "used_at")?.is_some(),
+        reader: get(row, "reader")?,
     })
+}
+
+const ADMIN_CHANGE_COLUMNS: &str = "id, kind, payload, requested_by, approved_by, expires_at";
+
+fn admin_change_from(row: &PgRow) -> Result<AdminChangeRecord, StoreError> {
+    Ok(AdminChangeRecord {
+        id: get(row, "id")?,
+        kind: get(row, "kind")?,
+        payload: get(row, "payload")?,
+        requested_by: get(row, "requested_by")?,
+        approved_by: get(row, "approved_by")?,
+        expires_at: get(row, "expires_at")?,
+    })
+}
+
+/// Share checks as one column: `x ‖ hash` per share.
+fn share_checks_to_bytes(checks: &[(u8, [u8; 32])]) -> Option<Vec<u8>> {
+    if checks.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(checks.len() * 33);
+    for (x, h) in checks {
+        out.push(*x);
+        out.extend_from_slice(h);
+    }
+    Some(out)
+}
+
+fn share_checks_from_bytes(bytes: Option<Vec<u8>>) -> Result<Vec<(u8, [u8; 32])>, StoreError> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    let (records, rest) = bytes.as_chunks::<33>();
+    if records.is_empty() || !rest.is_empty() {
+        return Err(StoreError::Corrupt("share checks length"));
+    }
+    records
+        .iter()
+        .map(|c| {
+            let (x, h) = c
+                .split_first()
+                .ok_or(StoreError::Corrupt("share checks length"))?;
+            let h: [u8; 32] = h
+                .try_into()
+                .map_err(|_| StoreError::Corrupt("share checks length"))?;
+            Ok((*x, h))
+        })
+        .collect()
 }
 
 // --- The store -------------------------------------------------------------------------------------------
@@ -521,7 +572,7 @@ impl KeyStore for PgStore {
     async fn seal_config(&self) -> Result<Option<SealConfig>, StoreError> {
         let row = sqlx::query(
             "SELECT root_key_id, root_key_version, wrapped_root, mode, shamir_threshold, shamir_shares, \
-             pass_m_kib, pass_t_cost, pass_p_cost, pass_salt FROM seal_config",
+             pass_m_kib, pass_t_cost, pass_p_cost, pass_salt, shamir_share_checks FROM seal_config",
         )
         .fetch_optional(&self.pool)
         .await
@@ -567,8 +618,8 @@ impl KeyStore for PgStore {
         };
         let done = sqlx::query(
             "INSERT INTO seal_config (root_key_id, root_key_version, wrapped_root, mode, shamir_threshold, \
-             shamir_shares, pass_m_kib, pass_t_cost, pass_p_cost, pass_salt) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (singleton) DO NOTHING",
+             shamir_shares, pass_m_kib, pass_t_cost, pass_p_cost, pass_salt, shamir_share_checks) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (singleton) DO NOTHING",
         )
         .bind(config.root.id.as_slice())
         .bind(big(config.root.version))
@@ -580,6 +631,7 @@ impl KeyStore for PgStore {
         .bind(t_cost)
         .bind(p_cost)
         .bind(salt)
+        .bind(share_checks_to_bytes(&config.share_checks))
         .execute(&self.pool)
         .await
         .map_err(|e| insert_error(e, &[], StoreError::Conflict("record violates a constraint")))?;
@@ -1188,6 +1240,53 @@ impl KeyStore for PgStore {
         .collect()
     }
 
+    async fn subject_facts(
+        &self,
+        domain_id: &Id,
+        subject_hmac: &[u8; 32],
+        limit: u32,
+    ) -> Result<Vec<SubjectFact>, StoreError> {
+        // One statement, so the fact, subject key and domain states come from one snapshot.
+        sqlx::query(
+            "SELECT f.fact_id, f.fact_type, f.kind, f.created_at, f.expires_at, f.legal_hold, f.shredded_at, \
+               (f.state = 'shredded' OR s.state IS DISTINCT FROM 'active' OR d.state = 'shredded') AS gone \
+             FROM facts f \
+             JOIN domains d ON d.domain_id = f.domain_id \
+             LEFT JOIN subject_keys s ON s.domain_id = f.domain_id AND s.subject_hmac = f.subject_hmac \
+                                     AND s.version = f.subject_key_version \
+             WHERE f.domain_id = $1 AND f.subject_hmac = $2 \
+             ORDER BY f.created_at, f.fact_id LIMIT $3",
+        )
+        .bind(domain_id.as_slice())
+        .bind(subject_hmac.as_slice())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?
+        .iter()
+        .map(|r| {
+            Ok(SubjectFact {
+                fact_id: get(r, "fact_id")?,
+                fact_type: get(r, "fact_type")?,
+                kind: match get::<String>(r, "kind")?.as_str() {
+                    "fact" => FactKind::Fact,
+                    "blob" => FactKind::Blob,
+                    _ => return Err(StoreError::Corrupt("unknown fact kind")),
+                },
+                state: if get::<bool>(r, "gone")? {
+                    State::Shredded
+                } else {
+                    State::Active
+                },
+                created_at: get(r, "created_at")?,
+                expires_at: get(r, "expires_at")?,
+                legal_hold: get(r, "legal_hold")?,
+                shredded_at: get(r, "shredded_at")?,
+            })
+        })
+        .collect()
+    }
+
     async fn subject_active_versions(
         &self,
         domain_id: &Id,
@@ -1543,9 +1642,9 @@ impl KeyStore for PgStore {
     async fn create_approval(&self, new: &NewApproval) -> Result<ApprovalRecord, StoreError> {
         let row = sqlx::query(
             "INSERT INTO approvals (id, domain_id, fact_id, requested_by, approved_by, approved_at, \
-             break_glass, expires_at) \
-             VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN $4 END, CASE WHEN $5 THEN now() END, $5, $6) \
-             RETURNING id, domain_id, fact_id, requested_by, approved_by, break_glass, expires_at, used_at",
+             break_glass, expires_at, reader) \
+             VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN $4 END, CASE WHEN $5 THEN now() END, $5, $6, $7) \
+             RETURNING id, domain_id, fact_id, requested_by, approved_by, break_glass, expires_at, used_at, reader",
         )
         .bind(new.id)
         .bind(new.domain_id.as_slice())
@@ -1553,6 +1652,7 @@ impl KeyStore for PgStore {
         .bind(new.requested_by.as_str())
         .bind(new.break_glass)
         .bind(new.expires_at)
+        .bind(new.reader.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -1573,7 +1673,7 @@ impl KeyStore for PgStore {
     ) -> Result<ApprovalRecord, StoreError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
         let row = sqlx::query(
-            "SELECT id, domain_id, fact_id, requested_by, approved_by, break_glass, expires_at, used_at \
+            "SELECT id, domain_id, fact_id, requested_by, approved_by, break_glass, expires_at, used_at, reader \
              FROM approvals WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -1611,18 +1711,20 @@ impl KeyStore for PgStore {
         domain_id: &Id,
         id: &Uuid,
         fact_id: &FactId,
+        caller: &str,
         now: OffsetDateTime,
     ) -> Result<(), StoreError> {
         // One statement, so two uses at once cannot both succeed: only one UPDATE sees `used_at IS NULL`.
         let done = sqlx::query(
             "UPDATE approvals SET used_at = now() \
              WHERE id = $1 AND domain_id = $2 AND fact_id = $3 AND approved_by IS NOT NULL \
-               AND used_at IS NULL AND expires_at > $4",
+               AND used_at IS NULL AND expires_at > $4 AND reader = $5",
         )
         .bind(id)
         .bind(domain_id.as_slice())
         .bind(fact_id)
         .bind(now)
+        .bind(caller)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -1630,6 +1732,83 @@ impl KeyStore for PgStore {
             return Err(StoreError::Conflict("approval is not valid"));
         }
         Ok(())
+    }
+
+    async fn create_admin_change(
+        &self,
+        new: &NewAdminChange,
+    ) -> Result<AdminChangeRecord, StoreError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO admin_changes (id, kind, payload, requested_by, expires_at) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING {ADMIN_CHANGE_COLUMNS}"
+        )))
+        .bind(new.id)
+        .bind(new.kind.as_str())
+        .bind(new.payload.as_slice())
+        .bind(new.requested_by.as_str())
+        .bind(new.expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            insert_error(
+                e,
+                &[("admin_changes_pkey", StoreError::AlreadyExists)],
+                StoreError::Conflict("admin change violates a constraint"),
+            )
+        })?;
+        admin_change_from(&row)
+    }
+
+    async fn admin_change(&self, id: &Uuid) -> Result<AdminChangeRecord, StoreError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ADMIN_CHANGE_COLUMNS} FROM admin_changes WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?
+        .ok_or(StoreError::NotFound)?;
+        admin_change_from(&row)
+    }
+
+    async fn approve_admin_change(
+        &self,
+        id: &Uuid,
+        approver: &str,
+        now: OffsetDateTime,
+    ) -> Result<AdminChangeRecord, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {ADMIN_CHANGE_COLUMNS} FROM admin_changes WHERE id = $1 FOR UPDATE"
+        )))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .ok_or(StoreError::NotFound)?;
+        let rec = admin_change_from(&row)?;
+        if rec.approved_by.is_some() {
+            return Err(StoreError::Conflict("already approved"));
+        }
+        if rec.expires_at <= now {
+            return Err(StoreError::Conflict("the request expired"));
+        }
+        if rec.requested_by == approver {
+            return Err(StoreError::Conflict(
+                "an approver must not be the requester",
+            ));
+        }
+        sqlx::query("UPDATE admin_changes SET approved_by = $2, approved_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(approver)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(AdminChangeRecord {
+            approved_by: Some(approver.to_owned()),
+            ..rec
+        })
     }
 }
 

@@ -14,7 +14,7 @@ use pvlt_core::objects::ObjectStore;
 use pvlt_core::store::KeyStore;
 use zeroize::Zeroizing;
 
-use crate::backup::{self, BackupError};
+use crate::backup::{self, BackupError, SigningKey, Trust};
 
 fn err(m: impl Into<String>) -> BackupError {
     BackupError(m.into())
@@ -43,16 +43,18 @@ fn read_secret_file(path: &Path) -> Result<Zeroizing<String>, BackupError> {
         .map_err(|e| err(format!("cannot read {}: {}", path.display(), e.kind())))
 }
 
-/// Exports the key store, encrypts it to `recipients` and writes it to `out`. Returns how many rows it holds.
+/// Exports the key store, signs it with `signer`, encrypts it to `recipients` and writes it to `out`. Returns how
+/// many rows it holds.
 pub async fn backup_to_file(
     store: &PgStore,
     out: &Path,
     recipients: &[String],
+    signer: &SigningKey,
 ) -> Result<usize, BackupError> {
     let dump = store.export_all().await.map_err(|e| err(e.to_string()))?;
     let rows = dump.iter().map(|t| t.rows.len()).sum();
     let created = ledger::format_time(time::OffsetDateTime::now_utc());
-    let plain = backup::encode(&created, &dump)?;
+    let plain = backup::encode(&created, &dump, signer)?;
     let cipher = backup::encrypt(&plain, recipients)?;
     write_new(out, &cipher)?;
     Ok(rows)
@@ -65,8 +67,9 @@ pub async fn restore_from_file<O: ObjectStore, A: Auditor>(
     engine: &Engine<PgStore, O, A>,
     input: &Path,
     identity_file: &Path,
+    trust: &Trust,
 ) -> Result<ReconcileReport, BackupError> {
-    let dump = read_backup(input, identity_file)?;
+    let dump = read_backup(input, identity_file, trust)?;
     store
         .import_all(&dump)
         .await
@@ -80,28 +83,34 @@ pub async fn restore_from_file<O: ObjectStore, A: Auditor>(
 /// Rewrites a backup so everything shredded since it was taken is already shredded in it, which lets an old
 /// backup be kept or handed on without the keys of people who have since been erased. It loads the backup into
 /// a scratch key store (`scratch`, which must be empty), replays the bucket's ledger there, and exports that.
+///
+/// It takes both ends of a backup: what to trust in the one it reads, and what to sign the one it writes with.
+#[allow(clippy::too_many_arguments)]
 pub async fn scrub_backup<O: ObjectStore, A: Auditor>(
     scratch: &PgStore,
     engine: &Engine<PgStore, O, A>,
     input: &Path,
     identity_file: &Path,
+    trust: &Trust,
     out: &Path,
     recipients: &[String],
+    signer: &SigningKey,
 ) -> Result<ReconcileReport, BackupError> {
-    let report = restore_from_file(scratch, engine, input, identity_file).await?;
-    backup_to_file(scratch, out, recipients).await?;
+    let report = restore_from_file(scratch, engine, input, identity_file, trust).await?;
+    backup_to_file(scratch, out, recipients, signer).await?;
     Ok(report)
 }
 
 fn read_backup(
     input: &Path,
     identity_file: &Path,
+    trust: &Trust,
 ) -> Result<Vec<crate::pg::TableDump>, BackupError> {
     let cipher = std::fs::read(input)
         .map_err(|e| err(format!("cannot read {}: {}", input.display(), e.kind())))?;
     let identity = read_secret_file(identity_file)?;
     let plain = backup::decrypt(&cipher, &identity)?;
-    backup::decode(&plain)
+    backup::decode(&plain, trust)
 }
 
 /// Whether the engine's store is what the tools were given. A guard against pointing `restore` at a live

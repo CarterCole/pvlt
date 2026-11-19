@@ -128,19 +128,27 @@ pub struct Require {
     pub reason: bool,
 }
 
-/// Rate limits for a role, per caller.
+/// Rate limits for a role. The plain limits count each caller on its own; the `total_` limits count every caller
+/// of the role together. The caller is a claim the issuer writes, so an issuer that invents a new caller name for
+/// every request is held only by a total.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoleLimits {
-    /// Reads per hour.
+    /// Reads per hour, per caller.
     pub read_per_hour: Option<u32>,
-    /// Creates per hour.
+    /// Creates per hour, per caller.
     pub create_per_hour: Option<u32>,
-    /// Shreds per hour.
+    /// Shreds per hour, per caller.
     pub shred_per_hour: Option<u32>,
+    /// Reads per hour by every caller of the role together.
+    pub total_read_per_hour: Option<u32>,
+    /// Creates per hour by every caller of the role together.
+    pub total_create_per_hour: Option<u32>,
+    /// Shreds per hour by every caller of the role together.
+    pub total_shred_per_hour: Option<u32>,
 }
 
 impl RoleLimits {
-    /// The limit for an action, if there is one.
+    /// The per-caller limit for an action, if there is one.
     pub fn for_action(&self, action: Action) -> Option<u32> {
         match action {
             Action::Read => self.read_per_hour,
@@ -148,6 +156,23 @@ impl RoleLimits {
             Action::Shred => self.shred_per_hour,
             Action::Rebind => None,
         }
+    }
+
+    /// The limit for an action over every caller of the role, if there is one.
+    pub fn total_for_action(&self, action: Action) -> Option<u32> {
+        match action {
+            Action::Read => self.total_read_per_hour,
+            Action::Create => self.total_create_per_hour,
+            Action::Shred => self.total_shred_per_hour,
+            Action::Rebind => None,
+        }
+    }
+
+    /// Whether some action has a per-caller limit and no total, so an issuer that varies the caller is not held.
+    pub fn per_caller_only(&self) -> bool {
+        [Action::Read, Action::Create, Action::Shred]
+            .into_iter()
+            .any(|a| self.for_action(a).is_some() && self.total_for_action(a).is_none())
     }
 }
 
@@ -240,6 +265,38 @@ struct LimitsDoc {
     create_per_hour: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shred_per_hour: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_read_per_hour: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_create_per_hour: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_shred_per_hour: Option<u32>,
+}
+
+impl From<&LimitsDoc> for RoleLimits {
+    fn from(l: &LimitsDoc) -> Self {
+        Self {
+            read_per_hour: l.read_per_hour,
+            create_per_hour: l.create_per_hour,
+            shred_per_hour: l.shred_per_hour,
+            total_read_per_hour: l.total_read_per_hour,
+            total_create_per_hour: l.total_create_per_hour,
+            total_shred_per_hour: l.total_shred_per_hour,
+        }
+    }
+}
+
+impl From<&RoleLimits> for LimitsDoc {
+    fn from(l: &RoleLimits) -> Self {
+        Self {
+            read_per_hour: l.read_per_hour,
+            create_per_hour: l.create_per_hour,
+            shred_per_hour: l.shred_per_hour,
+            total_read_per_hour: l.total_read_per_hour,
+            total_create_per_hour: l.total_create_per_hour,
+            total_shred_per_hour: l.total_shred_per_hour,
+        }
+    }
 }
 
 impl Policy {
@@ -307,11 +364,7 @@ impl Policy {
                         purposes: role.require.purposes,
                         reason: role.require.reason,
                     },
-                    limits: RoleLimits {
-                        read_per_hour: role.limits.read_per_hour,
-                        create_per_hour: role.limits.create_per_hour,
-                        shred_per_hour: role.limits.shred_per_hour,
-                    },
+                    limits: RoleLimits::from(&role.limits),
                 },
             );
         }
@@ -362,11 +415,7 @@ impl Policy {
                                 purposes: sorted(&r.require.purposes),
                                 reason: r.require.reason,
                             },
-                            limits: LimitsDoc {
-                                read_per_hour: r.limits.read_per_hour,
-                                create_per_hour: r.limits.create_per_hour,
-                                shred_per_hour: r.limits.shred_per_hour,
-                            },
+                            limits: LimitsDoc::from(&r.limits),
                         },
                     )
                 })
@@ -494,14 +543,10 @@ impl Policy {
         for (name, role) in usable {
             match role_allows(role, ctx, req) {
                 Ok(()) => {
-                    let restricted = req.action == Action::Read
-                        && req
-                            .fact_type
-                            .is_some_and(|t| self.restricted_types.iter().any(|r| r == t));
                     return Decision::Allow(Allowed {
                         role: name.clone(),
                         limits: role.limits,
-                        restricted,
+                        restricted: self.is_restricted(req),
                     });
                 }
                 Err(d) => best = further(best, d),
@@ -510,22 +555,37 @@ impl Policy {
         Decision::Deny(best)
     }
 
-    /// Whether the policy defines the `compat` role, which is what narrows the static compat token. Without it
-    /// that token may do anything.
+    /// Whether this request is a read of a restricted type, which needs a dual-control approval.
+    fn is_restricted(&self, req: &Request<'_>) -> bool {
+        req.action == Action::Read
+            && req
+                .fact_type
+                .is_some_and(|t| self.restricted_types.iter().any(|r| r == t))
+    }
+
+    /// Whether the policy defines the `compat` role, which is the only thing that lets the static compat token
+    /// do anything.
     pub fn has_compat_role(&self) -> bool {
         self.roles.contains_key(COMPAT_ROLE)
     }
 
-    /// Decides a request for the static compat token, which runs as the role named `compat`. If the policy has
-    /// no such role the request is **allowed with no limits**, which is what the compat routes did before there
-    /// was a policy: a deployment that wants the compat token narrowed defines the role.
+    /// The roles that set a per-caller rate limit without a total for the same action, which an issuer that
+    /// varies the caller claim can multiply. The server warns about them.
+    pub fn roles_without_totals(&self) -> Vec<&str> {
+        self.roles
+            .iter()
+            .filter(|(_, r)| r.limits.per_caller_only())
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+
+    /// Decides a request for the static compat token, which runs as the role named `compat`. Without that role
+    /// everything is refused, like any other token with no usable role. The compat token can never present a
+    /// dual-control approval, so a read of a restricted type is refused too (`approval_required`): release such a
+    /// fact through `/v2` with an approval.
     pub fn decide_compat(&self, req: &Request<'_>) -> Decision {
         match self.roles.get(COMPAT_ROLE) {
-            None => Decision::Allow(Allowed {
-                role: COMPAT_ROLE.to_owned(),
-                limits: RoleLimits::default(),
-                restricted: false,
-            }),
+            None => Decision::Deny(Denial::NoUsableRole),
             Some(role) => {
                 let ctx = Context {
                     roles: &[],
@@ -542,7 +602,7 @@ impl Policy {
                     Ok(()) => Decision::Allow(Allowed {
                         role: COMPAT_ROLE.to_owned(),
                         limits: role.limits,
-                        restricted: false,
+                        restricted: self.is_restricted(req),
                     }),
                     Err(d) => Decision::Deny(d),
                 }

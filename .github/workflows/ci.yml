@@ -1,7 +1,9 @@
 name: ci
-on: [push, pull_request]
+# Also called by the release workflow, so nothing is published from a commit this has not passed on.
+on: [push, pull_request, workflow_call]
 permissions: { contents: read }
 env: { CARGO_TERM_COLOR: always }
+# Every action is pinned to a commit; the comment says which release it is. Dependabot proposes updates.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,31 +17,39 @@ jobs:
     env:
       PVLT_TEST_DATABASE_URL: postgres://postgres:pvlt@localhost:5432/pvlt
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: "rustfmt, clippy" }
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with: { toolchain: stable, components: "rustfmt, clippy" }
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 24 }
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --locked --features pvlt-server/dev-insecure -- -D warnings
       - run: cargo test --workspace --locked -- --include-ignored
-      - name: default binary has no dev-insecure symbols
+      # The marker is a string compiled in exactly when the dev-insecure conveniences are (pvlt-server lib.rs).
+      # Checking that a dev-insecure build has it proves the check can still see what it is looking for.
+      - name: the default binary has no dev-insecure code, and the check can tell
         run: |
+          marker="pvlt-build-marker:dev-insecure-conveniences-present"
           cargo build --release --locked -p pvlt-server
-          if strings target/release/pvlt | grep -q "insecure-dev-listener"; then echo "dev-insecure code present"; exit 1; fi
+          if grep -aqF "$marker" target/release/pvlt; then echo "dev-insecure code in the default build"; exit 1; fi
+          if ./target/release/pvlt version | grep -q dev-insecure; then echo "the default build says it is dev-insecure"; exit 1; fi
+          # A debug build, so it reuses what the tests compiled. Nothing after this step uses target/debug/pvlt.
+          cargo build --locked -p pvlt-server --features dev-insecure
+          if ! grep -aqF "$marker" target/debug/pvlt; then echo "the marker check sees nothing: fix it"; exit 1; fi
       - run: (cd spec/reference && uv run gen_vectors.py --check)
       - run: (cd clients/typescript && node --test test/*.test.ts)
       - run: (cd clients/python && python3 -m unittest -v)
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with: { toolchain: "1.94" }
       - run: cargo check --workspace --locked
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2

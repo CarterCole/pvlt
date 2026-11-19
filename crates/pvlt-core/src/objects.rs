@@ -32,6 +32,27 @@ impl ObjectKey {
         )
     }
 
+    /// Where a client uploads a blob's object before the vault has checked it. The vault copies it to
+    /// [`ObjectKey::path`] on completion, so an upload address handed to a client can never write the object a
+    /// reader is given. The id is derived from this key's object id, so it needs no row of its own, and no fact
+    /// holds a key for it: the sweeper removes a staging object once it is older than its grace period.
+    pub fn staging(&self) -> ObjectKey {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::new()
+            .chain_update(pvlt_format::PREFIX)
+            .chain_update(b"upload-staging\0")
+            .chain_update(self.domain_id)
+            .chain_update(self.object_id)
+            .finalize()
+            .into();
+        let mut object_id = [0u8; 16];
+        object_id.copy_from_slice(digest.get(..16).unwrap_or(&[0; 16]));
+        ObjectKey {
+            domain_id: self.domain_id,
+            object_id,
+        }
+    }
+
     /// The prefix that holds every object of a domain.
     pub fn domain_prefix(domain_id: &Id) -> String {
         format!("v1/{}/", hex::encode(domain_id))
@@ -136,6 +157,22 @@ pub trait ObjectStore: Send + Sync {
                     .min(b.len());
                 b.get(from..to).unwrap_or_default().to_vec()
             }))
+        }
+    }
+
+    /// Copies a file to another path, replacing what is there. [`ObjectError`] if `from` does not exist. The
+    /// default reads and writes the whole file; real stores override it with a server-side copy.
+    fn copy_path(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
+        async move {
+            let bytes = self
+                .get_path(from)
+                .await?
+                .ok_or_else(|| ObjectError("the file to copy does not exist".to_owned()))?;
+            self.put_path(to, bytes).await
         }
     }
 
@@ -287,6 +324,16 @@ impl<D: ObjectStore, L: ObjectStore> ObjectStore for SplitStore<D, L> {
         }
     }
 
+    async fn copy_path(&self, from: &str, to: &str) -> Result<(), ObjectError> {
+        match (is_log_path(from), is_log_path(to)) {
+            (false, false) => self.data.copy_path(from, to).await,
+            (true, true) => self.logs.copy_path(from, to).await,
+            _ => Err(ObjectError(
+                "cannot copy between the data and log buckets".to_owned(),
+            )),
+        }
+    }
+
     async fn presign_put(&self, path: &str, ttl: Duration) -> Result<Option<String>, ObjectError> {
         if is_log_path(path) {
             Ok(None)
@@ -320,6 +367,12 @@ mod tests {
             "v1/abababababababababababababababab/01/01010101010101010101010101010101"
         );
         assert_eq!(ObjectKey::from_path(&path), Some(key));
+        // The staging key is an ordinary object key of the same domain, different from the object's own.
+        let staging = key.staging();
+        assert_eq!(staging.domain_id, key.domain_id);
+        assert_ne!(staging.object_id, key.object_id);
+        assert_eq!(ObjectKey::from_path(&staging.path()), Some(staging));
+        assert_eq!(staging, key.staging());
     }
 
     #[test]

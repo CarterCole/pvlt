@@ -41,7 +41,8 @@ fn arena() -> Arena {
     Arena::new(256, LockPolicy::BestEffort).unwrap()
 }
 
-fn rig(unsealed: bool, compat: bool, max_value_len: usize) -> Rig {
+/// A rig with no policy at all, so the compat token, if set, is refused everything.
+fn bare_rig(unsealed: bool, compat: bool, max_value_len: usize) -> Rig {
     let a = arena();
     let init = init_shamir(&a, 2, 3).unwrap();
     let shares: Vec<String> = init
@@ -75,8 +76,32 @@ fn rig(unsealed: bool, compat: bool, max_value_len: usize) -> Rig {
     }
 }
 
-fn default_rig() -> Rig {
-    rig(true, true, 1_048_576)
+/// A rig whose policy lets the compat token do everything to the types OPV clients use, as a deployment that
+/// serves `/api/v1` sets it up. Installed straight into the key store, so it works on a sealed vault too.
+async fn rig(unsealed: bool, compat: bool, max_value_len: usize) -> Rig {
+    let r = bare_rig(unsealed, compat, max_value_len);
+    if compat {
+        install_policy(&r, COMPAT_ALL).await;
+    }
+    r
+}
+
+async fn default_rig() -> Rig {
+    rig(true, true, 1_048_576).await
+}
+
+const COMPAT_ALL: &str = r#"{"version":1,"roles":{"compat":{"allow":[{"types":["*"],"actions":["create","read","shred"]}]}}}"#;
+
+async fn install_policy(r: &Rig, json: &str) {
+    use pvlt_core::store::KeyStore;
+    let p = pvlt_policy::policy::Policy::from_json(json.as_bytes()).unwrap();
+    r.app
+        .engine
+        .store()
+        .put_policy(&p.canonical_json().unwrap(), &p.hash().unwrap(), "admin")
+        .await
+        .unwrap();
+    r.app.reload_access().await.unwrap();
 }
 
 async fn call(
@@ -140,7 +165,7 @@ async fn store(r: &Rig, fact_type: &str, scope: &str, value: &str) -> (StatusCod
 
 #[tokio::test]
 async fn the_three_calls_an_opv_client_makes_work_end_to_end() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (status, body, _) = store(&r, "ascii", "kyc-doc:42", SECRET).await;
     assert_eq!(status, StatusCode::OK);
     let id = body["id"].as_str().unwrap().to_owned();
@@ -193,7 +218,7 @@ async fn the_three_calls_an_opv_client_makes_work_end_to_end() {
 
 #[tokio::test]
 async fn deleting_a_fact_that_never_existed_is_a_404_which_clients_also_count_as_success() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (status, ..) = call(
         &r.data,
         Method::DELETE,
@@ -216,7 +241,7 @@ async fn deleting_a_fact_that_never_existed_is_a_404_which_clients_also_count_as
 
 #[tokio::test]
 async fn every_fact_type_clients_use_round_trips() {
-    let r = default_rig();
+    let r = default_rig().await;
     for (kind, value) in [
         ("ascii", "plain ascii"),
         ("printableascii", "Printable-ASCII 123"),
@@ -244,7 +269,7 @@ async fn every_fact_type_clients_use_round_trips() {
 
 #[tokio::test]
 async fn a_random_uuid_scope_and_a_meaningful_scope_both_work() {
-    let r = default_rig();
+    let r = default_rig().await;
     for scope in [
         "8d3e1c58-6b8f-4d0a-9b53-5a8a1d0f6a11",
         "model-release:77",
@@ -260,7 +285,7 @@ async fn a_random_uuid_scope_and_a_meaningful_scope_both_work() {
 
 #[tokio::test]
 async fn requests_without_the_right_token_are_refused() {
-    let r = default_rig();
+    let r = default_rig().await;
     let body = json!({"fact_type_slug":"ascii","scope_custom_id":"s","value":"v"});
     for headers in [
         vec![],
@@ -303,14 +328,14 @@ async fn requests_without_the_right_token_are_refused() {
 
 #[tokio::test]
 async fn with_no_compat_token_configured_every_request_is_refused() {
-    let r = rig(true, false, 1_048_576);
+    let r = rig(true, false, 1_048_576).await;
     let (status, ..) = store(&r, "ascii", "s", "v").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn bad_values_and_types_are_400_and_never_echoed() {
-    let r = default_rig();
+    let r = default_rig().await;
     let cases = [
         ("unknown type", "ssn", "ok-value"),
         ("non-ascii in ascii", "ascii", "caf\u{e9}-SECRETVALUE"),
@@ -336,7 +361,7 @@ async fn bad_values_and_types_are_400_and_never_echoed() {
 
 #[tokio::test]
 async fn malformed_requests_are_400_without_an_echo() {
-    let r = default_rig();
+    let r = default_rig().await;
     let headers = [("X-OPV-GRANT-TOKEN", TOKEN)];
     for body in [
         String::new(),
@@ -368,7 +393,7 @@ async fn malformed_requests_are_400_without_an_echo() {
 
 #[tokio::test]
 async fn an_oversized_request_is_refused() {
-    let r = rig(true, true, 100);
+    let r = rig(true, true, 100).await;
     let (status, ..) = store(&r, "ascii", "s", &"x".repeat(101)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -383,7 +408,7 @@ async fn an_oversized_request_is_refused() {
 
 #[tokio::test]
 async fn neither_store_holds_the_value_or_scope_after_http_calls() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (_, body, _) = store(&r, "ascii", "scope-of-quentin", SECRET).await;
     let id = body["id"].as_str().unwrap();
     let (_, got, _) = call(
@@ -408,8 +433,9 @@ async fn neither_store_holds_the_value_or_scope_after_http_calls() {
 
 #[tokio::test]
 async fn a_sealed_vault_says_so_and_unsealing_needs_enough_distinct_good_shares() {
-    let r = rig(false, true, 1_048_576);
-    allow_compat(&r).await;
+    // The rig installs the compat policy straight into the key store: over the admin route it would be refused
+    // while sealed, because the change's audit entry cannot be written before the domain exists.
+    let r = rig(false, true, 1_048_576).await;
 
     let (status, body, _) = store(&r, "ascii", "s", "v").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -459,7 +485,7 @@ async fn a_sealed_vault_says_so_and_unsealing_needs_enough_distinct_good_shares(
     for bad in ["nonsense".to_owned(), "pvlt-share-v1:00".to_owned()] {
         assert_eq!(submit(bad).await.0, StatusCode::BAD_REQUEST);
     }
-    let other = rig(false, true, 1_048_576).shares[0].clone();
+    let other = bare_rig(false, true, 1_048_576).shares[0].clone();
     let (status, _, text) = submit(other).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!text.contains("pvlt-share"));
@@ -479,9 +505,55 @@ async fn a_sealed_vault_says_so_and_unsealing_needs_enough_distinct_good_shares(
     );
 }
 
+/// A share with one secret byte changed and its checksum made good again: it looks valid in every way a holder
+/// could check, which is what someone who wants to spoil an unseal would send.
+fn forged(share: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut bytes = hex::decode(share.strip_prefix("pvlt-share-v1:").unwrap()).unwrap();
+    bytes.truncate(bytes.len() - 4);
+    bytes[1 + 1 + 16 + 1] ^= 0x01;
+    let check: [u8; 32] = Sha256::new()
+        .chain_update(pvlt_format::PREFIX)
+        .chain_update(b"share-check\0")
+        .chain_update(&bytes)
+        .finalize()
+        .into();
+    bytes.extend_from_slice(&check[..4]);
+    format!("pvlt-share-v1:{}", hex::encode(bytes))
+}
+
+#[tokio::test]
+async fn a_forged_share_sent_first_is_refused_and_cannot_spoil_the_unseal() {
+    let r = rig(false, true, 1_048_576).await;
+    let submit = |share: String| {
+        let admin = r.admin.clone();
+        async move {
+            call(
+                &admin,
+                Method::POST,
+                "/v2/sys/unseal",
+                &[],
+                Some(json!({"share": share})),
+            )
+            .await
+        }
+    };
+    let (status, _, text) = submit(forged(&r.shares[0])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(!text.contains("pvlt-share"));
+    assert_eq!(
+        r.app.unseal_status().submitted,
+        0,
+        "the forgery is not held"
+    );
+    // The real holders unseal as if nothing had happened.
+    assert_eq!(submit(r.shares[0].clone()).await.1["sealed"], json!(true));
+    assert_eq!(submit(r.shares[1].clone()).await.1["sealed"], json!(false));
+}
+
 #[tokio::test]
 async fn sealing_needs_the_admin_token_and_wipes_the_keys() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (_, body, _) = store(&r, "ascii", "s", SECRET).await;
     let id = body["id"].as_str().unwrap().to_owned();
 
@@ -532,7 +604,7 @@ async fn sealing_needs_the_admin_token_and_wipes_the_keys() {
 
 #[tokio::test]
 async fn the_admin_routes_are_not_on_the_data_router_and_the_data_routes_not_on_the_admin_one() {
-    let r = default_rig();
+    let r = default_rig().await;
     assert_eq!(
         call(&r.data, Method::GET, "/v2/sys/status", &[], None)
             .await
@@ -565,7 +637,7 @@ async fn the_admin_routes_are_not_on_the_data_router_and_the_data_routes_not_on_
 
 #[tokio::test]
 async fn readyz_reports_the_memory_protections_and_the_build() {
-    let r = default_rig();
+    let r = default_rig().await;
     allow_compat(&r).await;
     let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -579,7 +651,7 @@ async fn readyz_reports_the_memory_protections_and_the_build() {
 
 #[tokio::test]
 async fn error_responses_carry_only_a_code_and_a_fixed_message() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (_, body, _) = call(&r.data, Method::GET, "/api/v1/facts/x", &auth(), None).await;
     let keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, ["error", "message"]);
@@ -607,12 +679,18 @@ async fn allow_compat(r: &Rig) {
 }
 
 #[tokio::test]
-async fn a_compat_token_without_a_compat_role_is_not_ready_and_the_role_makes_it_ready() {
-    let r = default_rig();
+async fn a_compat_token_without_a_compat_role_is_refused_and_not_ready_and_the_role_fixes_both() {
+    let r = bare_rig(true, true, 1_048_576);
     let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
     assert_eq!(
         (status, body["compat_policy"].clone(), body["ready"].clone()),
         (StatusCode::SERVICE_UNAVAILABLE, json!(false), json!(false))
+    );
+    // Refused, not waved through: a token the policy does not mention may do nothing.
+    let (status, body, _) = store(&r, "ascii", "s", "v").await;
+    assert_eq!(
+        (status, body["message"].clone()),
+        (StatusCode::FORBIDDEN, json!("no_usable_role"))
     );
     allow_compat(&r).await;
     let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
@@ -620,11 +698,53 @@ async fn a_compat_token_without_a_compat_role_is_not_ready_and_the_role_makes_it
         (status, body["compat_policy"].clone(), body["ready"].clone()),
         (StatusCode::OK, json!(true), json!(true))
     );
+    assert_eq!(store(&r, "ascii", "s", "v").await.0, StatusCode::OK);
     // No compat token configured: nothing to narrow, so no policy is needed.
-    let none = rig(true, false, 1_048_576);
+    let none = rig(true, false, 1_048_576).await;
     assert_eq!(
         call(&none.data, Method::GET, "/readyz", &[], None).await.0,
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_compat_token_cannot_read_a_restricted_type_because_it_cannot_present_an_approval() {
+    let r = bare_rig(true, true, 1_048_576);
+    install_policy(
+        &r,
+        r#"{"version":1,"restricted_types":["base64"],"roles":{"compat":{"allow":[{"types":["*"],"actions":["create","read","shred"]}]}}}"#,
+    )
+    .await;
+    let (status, body, _) = store(&r, "base64", "kyc-doc:1", "a2V5LWJ5dGVz").await;
+    assert_eq!(status, StatusCode::OK);
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, body, text) = call(
+        &r.data,
+        Method::GET,
+        &format!("/api/v1/facts/{id}"),
+        &auth(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["message"].clone()),
+        (StatusCode::FORBIDDEN, json!("approval_required"))
+    );
+    assert!(!text.contains("a2V5LWJ5dGVz"));
+    // A type that is not restricted still reads.
+    let (_, body, _) = store(&r, "ascii", "s", "plain").await;
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, body, _) = call(
+        &r.data,
+        Method::GET,
+        &format!("/api/v1/facts/{id}"),
+        &auth(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["value"].clone()),
+        (StatusCode::OK, json!("plain"))
     );
 }
 
@@ -636,7 +756,7 @@ async fn admin_post(r: &Rig, path: &str, body: Value) -> (StatusCode, Value, Str
 
 #[tokio::test]
 async fn the_admin_shred_routes_need_the_admin_token_and_nothing_else_works_as_a_substitute() {
-    let r = default_rig();
+    let r = default_rig().await;
     for path in [
         "/v2/admin/shred/subject",
         "/v2/admin/shred/scope",
@@ -658,7 +778,7 @@ async fn the_admin_shred_routes_need_the_admin_token_and_nothing_else_works_as_a
 #[tokio::test]
 async fn compat_subjects_may_be_colon_ids_with_a_length_cap_and_one_subject_shred_covers_only_its_facts()
  {
-    let r = default_rig();
+    let r = default_rig().await;
     let create = |subject: String| {
         let data = r.data.clone();
         async move {
@@ -712,7 +832,7 @@ async fn compat_subjects_may_be_colon_ids_with_a_length_cap_and_one_subject_shre
 #[tokio::test]
 async fn a_subject_shred_through_the_admin_route_destroys_the_subjects_facts_and_writes_the_ledger()
 {
-    let r = default_rig();
+    let r = default_rig().await;
     allow_compat(&r).await;
     let create = |subject: &'static str, scope: &'static str, value: &'static str| {
         let data = r.data.clone();
@@ -802,7 +922,7 @@ async fn a_subject_shred_through_the_admin_route_destroys_the_subjects_facts_and
 
 #[tokio::test]
 async fn the_admin_routes_refuse_bad_input_without_echoing_it() {
-    let r = default_rig();
+    let r = default_rig().await;
     for (path, body) in [
         ("/v2/admin/shred/subject", json!({})),
         (
@@ -830,7 +950,7 @@ async fn the_admin_routes_refuse_bad_input_without_echoing_it() {
 
 #[tokio::test]
 async fn legal_hold_and_rebind_work_over_the_admin_route() {
-    let r = default_rig();
+    let r = default_rig().await;
     let (_, body, _) = store(&r, "ascii", "draft", "v").await;
     let id = body["id"].as_str().unwrap().to_owned();
     let (status, body, _) = admin_post(

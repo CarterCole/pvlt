@@ -1,9 +1,16 @@
-//! Key-store backups: framing, integrity, and `age` encryption.
+//! Key-store backups: framing, integrity, signing, and `age` encryption.
 //!
 //! A backup is the key store exported as JSON lines (see `crate::pg::PgStore::export_all`), closed with a line
-//! that holds the SHA-256 of everything before it, and encrypted with `age`. The file on disk is never
-//! plaintext: it holds wrapped keys and the access history, which are not secret enough to be keys but are not
-//! something to leave in a bucket in the clear (REQUIREMENTS 3.6.4, threat T3).
+//! that holds the SHA-256 of everything before it and an Ed25519 signature over that hash, and encrypted with
+//! `age`. The file on disk is never plaintext: it holds wrapped keys and the access history, which are not
+//! secret enough to be keys but are not something to leave in a bucket in the clear (REQUIREMENTS 3.6.4,
+//! threat T3).
+//!
+//! **Why it is signed.** `age` gives confidentiality, not authenticity: anyone who knows the public recipient
+//! can make a file that decrypts. Without a signature, someone who can write to backup storage could hand
+//! `pvlt restore` a key store of their own making, with their own token issuer and a policy that lets it read.
+//! The signing key belongs to the backup job (`pvlt backup-signing-keygen`); restore is told the public half
+//! and refuses anything it did not sign.
 //!
 //! **Recipients.** An X25519 recipient (`age1...`) is what `pvlt restore` can decrypt in-process. A hybrid
 //! post-quantum recipient (`age1tagpq...`) is accepted too, and is decrypted with the external `age` tool: the
@@ -38,8 +45,68 @@ fn err(m: impl Into<String>) -> BackupError {
     BackupError(m.into())
 }
 
-/// Frames a dump as JSON lines: a header, one line per row, and a closing hash.
-pub fn encode(created: &str, dump: &[TableDump]) -> Result<Zeroizing<Vec<u8>>, BackupError> {
+/// The key a backup job signs with: an Ed25519 seed, wiped when dropped.
+pub struct SigningKey(Zeroizing<[u8; 32]>);
+
+impl SigningKey {
+    /// A new random key.
+    pub fn generate() -> Result<Self, BackupError> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::fill(seed.as_mut_slice()).map_err(|_| err("no random numbers"))?;
+        Ok(Self(seed))
+    }
+
+    /// Reads a key from its text form: 64 hex characters.
+    pub fn from_hex(text: &str) -> Result<Self, BackupError> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(text.trim(), seed.as_mut_slice())
+            .map_err(|_| err("a backup signing key is 64 hex characters"))?;
+        Ok(Self(seed))
+    }
+
+    /// The text form, for `pvlt backup-signing-keygen`.
+    pub fn to_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.0.as_slice()))
+    }
+
+    /// The public key, which restore checks the signature against.
+    pub fn public(&self) -> [u8; 32] {
+        pvlt_format::log::public_key(&self.0)
+    }
+}
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SigningKey(..)")
+    }
+}
+
+/// Whom a backup must be signed by before it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// The backup job whose public key this is. Anything else is refused.
+    Signer([u8; 32]),
+    /// Accept a backup without checking who made it. Only for a backup made before backups were signed, by an
+    /// operator who knows where it came from.
+    Unsigned,
+}
+
+impl Trust {
+    /// Parses a public key given as 64 hex characters.
+    pub fn signer_hex(text: &str) -> Result<Self, BackupError> {
+        let mut key = [0u8; 32];
+        hex::decode_to_slice(text.trim(), &mut key)
+            .map_err(|_| err("a backup verify key is 64 hex characters"))?;
+        Ok(Trust::Signer(key))
+    }
+}
+
+/// Frames a dump as JSON lines: a header, one line per row, and a closing line with the hash and its signature.
+pub fn encode(
+    created: &str,
+    dump: &[TableDump],
+    signer: &SigningKey,
+) -> Result<Zeroizing<Vec<u8>>, BackupError> {
     let counts: serde_json::Map<String, Value> = dump
         .iter()
         .map(|t| (t.table.clone(), Value::from(t.rows.len())))
@@ -56,15 +123,25 @@ pub fn encode(created: &str, dump: &[TableDump]) -> Result<Zeroizing<Vec<u8>>, B
             line(&json!({"t": t.table, "r": row}))?;
         }
     }
-    let digest = Sha256::digest(out.as_slice());
-    out.extend_from_slice(json!({"end": hex::encode(digest)}).to_string().as_bytes());
+    let digest: [u8; 32] = Sha256::digest(out.as_slice()).into();
+    let sig = pvlt_format::log::backup_sign(&signer.0, &digest);
+    out.extend_from_slice(
+        json!({
+            "end": hex::encode(digest),
+            "sig": hex::encode(sig),
+            "signer": hex::encode(signer.public()),
+        })
+        .to_string()
+        .as_bytes(),
+    );
     out.push(b'\n');
     Ok(out)
 }
 
-/// Reads a framed backup. The closing hash, the header's counts and the table names are all checked, so a
-/// truncated or edited file is refused and never half-loaded.
-pub fn decode(bytes: &[u8]) -> Result<Vec<TableDump>, BackupError> {
+/// Reads a framed backup. The closing hash, the signature (unless `trust` is [`Trust::Unsigned`]), the header's
+/// counts and the table names are all checked, so a truncated, edited or substituted file is refused and never
+/// half-loaded.
+pub fn decode(bytes: &[u8], trust: &Trust) -> Result<Vec<TableDump>, BackupError> {
     let end_at = bytes
         .strip_suffix(b"\n")
         .and_then(|b| b.iter().rposition(|c| *c == b'\n'))
@@ -77,10 +154,26 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<TableDump>, BackupError> {
         .get("end")
         .and_then(Value::as_str)
         .ok_or_else(|| err("the backup has no closing hash"))?;
-    if hex::encode(Sha256::digest(body)) != want {
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    if hex::encode(digest) != want {
         return Err(err(
             "the backup's hash does not match: it is damaged or was edited",
         ));
+    }
+    if let Trust::Signer(public) = trust {
+        let signer = trailer.get("signer").and_then(Value::as_str);
+        let sig = trailer.get("sig").and_then(Value::as_str);
+        let (Some(signer), Some(sig)) = (signer, sig) else {
+            return Err(err(
+                "the backup is not signed; if it predates signed backups and you know where it came from, \
+                 restore it with --allow-unsigned",
+            ));
+        };
+        if signer != hex::encode(public) {
+            return Err(err("the backup was signed by a different key"));
+        }
+        pvlt_format::log::backup_verify(public, &digest, sig)
+            .map_err(|_| err("the backup's signature does not verify"))?;
     }
     let mut lines = body.split(|c| *c == b'\n').filter(|l| !l.is_empty());
     let header: Value = serde_json::from_slice(lines.next().ok_or_else(|| err("empty backup"))?)
@@ -219,24 +312,40 @@ mod tests {
             .collect()
     }
 
+    fn signer() -> SigningKey {
+        SigningKey::from_hex(&"07".repeat(32)).unwrap()
+    }
+
+    fn trusted() -> Trust {
+        Trust::Signer(signer().public())
+    }
+
     #[test]
     fn a_dump_round_trips_through_the_framing() {
-        let framed = encode("2026-11-16T00:00:00.000Z", &sample()).unwrap();
-        assert_eq!(decode(&framed).unwrap(), sample());
+        let framed = encode("2026-11-16T00:00:00.000Z", &sample(), &signer()).unwrap();
+        assert_eq!(decode(&framed, &trusted()).unwrap(), sample());
+        let key = SigningKey::from_hex(&signer().to_hex()).unwrap();
+        assert_eq!(key.public(), signer().public());
     }
 
     #[test]
     fn a_damaged_truncated_or_edited_backup_is_refused() {
-        let framed = encode("2026-11-16T00:00:00.000Z", &sample())
+        let framed = encode("2026-11-16T00:00:00.000Z", &sample(), &signer())
             .unwrap()
             .to_vec();
         for at in [0, 5, framed.len() / 2, framed.len() - 20] {
             let mut bad = framed.clone();
             bad[at] ^= 1;
-            assert!(decode(&bad).is_err(), "a flip at {at} was accepted");
+            assert!(
+                decode(&bad, &trusted()).is_err(),
+                "a flip at {at} was accepted"
+            );
         }
         for cut in [1, 10, framed.len() / 2, framed.len() - 1] {
-            assert!(decode(&framed[..framed.len() - cut]).is_err(), "cut {cut}");
+            assert!(
+                decode(&framed[..framed.len() - cut], &trusted()).is_err(),
+                "cut {cut}"
+            );
         }
         // A row dropped with the hash recomputed still fails the header's counts.
         let text = String::from_utf8(framed.clone()).unwrap();
@@ -246,16 +355,60 @@ mod tests {
         let body = format!("{}\n", lines.join("\n"));
         let digest = hex::encode(Sha256::digest(body.as_bytes()));
         let forged = format!("{body}{}\n", json!({"end": digest}));
-        assert!(decode(forged.as_bytes()).is_err());
-        assert!(decode(b"").is_err());
-        assert!(decode(b"{}\n").is_err());
+        assert!(decode(forged.as_bytes(), &Trust::Unsigned).is_err());
+        assert!(decode(b"", &trusted()).is_err());
+        assert!(decode(b"{}\n", &trusted()).is_err());
+    }
+
+    #[test]
+    fn a_backup_made_by_anyone_else_is_refused() {
+        // A key store of someone's own making: framed correctly, with a valid hash, but signed by another key,
+        // or not at all.
+        let mallory = SigningKey::from_hex(&"09".repeat(32)).unwrap();
+        let theirs = encode("t", &sample(), &mallory).unwrap();
+        assert_eq!(
+            decode(&theirs, &trusted()).unwrap_err().0,
+            "the backup was signed by a different key"
+        );
+        let text = String::from_utf8(theirs.to_vec()).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.pop();
+        let body = format!("{}\n", lines.join("\n"));
+        let digest = hex::encode(Sha256::digest(body.as_bytes()));
+        let unsigned = format!("{body}{}\n", json!({"end": digest}));
+        assert!(
+            decode(unsigned.as_bytes(), &trusted())
+                .unwrap_err()
+                .0
+                .contains("not signed")
+        );
+        // A signature over another body, under the right key's name, does not verify.
+        let stolen_sig = {
+            let good =
+                String::from_utf8(encode("other", &sample(), &signer()).unwrap().to_vec()).unwrap();
+            let last: Value = serde_json::from_str(good.lines().last().unwrap()).unwrap();
+            last["sig"].as_str().unwrap().to_owned()
+        };
+        let spliced = format!(
+            "{body}{}\n",
+            json!({"end": digest, "sig": stolen_sig, "signer": hex::encode(signer().public())})
+        );
+        assert_eq!(
+            decode(spliced.as_bytes(), &trusted()).unwrap_err().0,
+            "the backup's signature does not verify"
+        );
+        // With --allow-unsigned an old, unsigned backup still reads.
+        assert_eq!(
+            decode(unsigned.as_bytes(), &Trust::Unsigned).unwrap(),
+            sample()
+        );
     }
 
     #[test]
     fn a_backup_is_encrypted_and_only_the_right_identity_reads_it() {
         let (secret, recipient) = generate_identity();
         let (other_secret, _) = generate_identity();
-        let plain = encode("t", &sample()).unwrap();
+        let plain = encode("t", &sample(), &signer()).unwrap();
         let cipher = encrypt(&plain, std::slice::from_ref(&recipient)).unwrap();
         assert!(
             !cipher.windows(8).any(|w| w == b"pvlt-bac"),
@@ -274,7 +427,7 @@ mod tests {
 
     #[test]
     fn at_least_one_recipient_must_be_one_the_server_can_read() {
-        let plain = encode("t", &sample()).unwrap();
+        let plain = encode("t", &sample(), &signer()).unwrap();
         assert!(encrypt(&plain, &[]).is_err());
         assert!(encrypt(&plain, &["not a key".to_owned()]).is_err());
         let (_, recipient) = generate_identity();

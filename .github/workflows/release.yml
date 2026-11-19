@@ -1,44 +1,69 @@
 name: release
-# On a version tag (v0.1.0, ...): publish the server image to GitHub Container Registry and the crates to crates.io.
-# Tag only after CI is green on the commit. The crates job needs a CARGO_REGISTRY_TOKEN repository secret.
+# On a version tag (v0.1.0, ...): run CI on the tagged commit, then publish the server image to GitHub Container
+# Registry (with an SBOM and provenance, signed with Sigstore) and the crates to crates.io. Nothing is published
+# unless CI passes. The crates job needs a CARGO_REGISTRY_TOKEN repository secret.
 on:
   push:
     tags: ["v*"]
-permissions:
-  contents: read
-  packages: write
+# Nothing by default; each job asks for what it needs.
+permissions: {}
 jobs:
+  ci:
+    permissions: { contents: read }
+    uses: ./.github/workflows/ci.yml
+
   image:
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # keyless Sigstore signing
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: sign the image by digest
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        # An image reference must be lower case; the repository is CarterCole/pvlt. metadata-action lowercases the
+        # tags it pushes, so sign the same name.
+        run: cosign sign --yes "${IMAGE,,}@${DIGEST}"
+
   crates:
+    needs: ci
     runs-on: ubuntu-latest
+    permissions: { contents: read }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with: { toolchain: stable }
       - name: the tag matches the crate version
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')

@@ -20,7 +20,8 @@ services:
     ports: ["8443:8443"]
     volumes: ["./secrets:/secrets:ro"]
     environment:
-      PVLT_DATABASE_URL: postgres://postgres:change-me@postgres/pvlt
+      # The URL holds a password, so it is a file: a default build refuses a password in PVLT_DATABASE_URL.
+      PVLT_DATABASE_URL_FILE: /secrets/database_url
       PVLT_DOMAIN: 00000000-0000-4000-8000-000000000001
       PVLT_S3_BUCKET: pvlt
       PVLT_S3_ENDPOINT: http://minio:9000

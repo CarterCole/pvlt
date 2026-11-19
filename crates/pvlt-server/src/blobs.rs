@@ -165,7 +165,7 @@ async fn create<K, O, A>(
     State(app): State<Arc<App<K, O, A>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Ticket>, ApiError>
+) -> Result<Response, ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,
@@ -219,8 +219,10 @@ where
     };
     let sealed_size = blob::sealed_len(b.size, ticket.chunk_size)
         .ok_or(ApiError::BadRequest("bad size or chunk size"))?;
-    let upload = address(&app, &key, ticket.blob_id, true).await?;
-    Ok(Json(Ticket {
+    // The upload goes to a staging key, never to the object readers are given: the address stays valid for its
+    // whole lifetime, and completion copies a checked upload into place.
+    let upload = address(&app, &key.staging(), ticket.blob_id, true).await?;
+    Ok(crate::secret::json(&Ticket {
         id: ticket.blob_id,
         suite: ticket.suite.id(),
         chunk_size: ticket.chunk_size,
@@ -344,7 +346,7 @@ async fn access<K, O, A>(
     State(app): State<Arc<App<K, O, A>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<Access>, ApiError>
+) -> Result<Response, ApiError>
 where
     K: KeyStore + 'static,
     O: ObjectStore + 'static,
@@ -363,7 +365,7 @@ where
         object_id: a.object_id,
     };
     let download = address(&app, &key, id, false).await?;
-    Ok(Json(Access {
+    Ok(crate::secret::json(&Access {
         id,
         fact_type: a.fact_type.clone(),
         suite: pvlt_format::Suite::Aes256Gcm.id(),
@@ -450,8 +452,9 @@ where
     let body = stream::unfold(Some((app, stream_state)), |state| async move {
         let (app, mut s) = state?;
         match app.engine.next_blob_chunk(&mut s).await {
+            // The chunk's own wiped buffer becomes the body: no unwiped copy is made.
             Ok(Some(chunk)) => Some((
-                Ok::<_, std::io::Error>(Bytes::from(chunk.to_vec())),
+                Ok::<_, std::io::Error>(crate::secret::wiped_bytes(chunk)),
                 Some((app, s)),
             )),
             Ok(None) => None,
@@ -465,6 +468,7 @@ where
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(body))
         .map_err(|_| ApiError::Vault(VaultError::Unavailable("response")))
 }

@@ -217,6 +217,12 @@ v1/<hex(domain_id)>/<hex(object_id)[0..2]>/<hex(object_id)>
 No extension, timestamp, subject or fact id appears in the key or in object metadata. Writers MUST NOT set
 `Content-Type` beyond `application/octet-stream` and MUST NOT set user metadata.
 
+A client uploads a blob object to a **staging key** of the same shape, whose object id is
+`SHA-256(PREFIX ‖ "upload-staging" ‖ 0x00 ‖ domain_id ‖ object_id)[0..16]`, and the vault copies it to the
+object's own key when the upload is completed and checked. An upload address therefore never names the object
+readers are given. No row holds a key for a staging id, so a staging object left behind is swept like any other
+object without a key. The object header (and so the AEAD associated data) names `object_id`, not the staging id.
+
 Other prefixes in the same bucket, or in a separate bucket that is never rolled back (preferred):
 
 | Prefix | Contents |
@@ -293,6 +299,7 @@ Audit entry types. Every audit body has the same fields; a field that does not a
 | `create`, `shred`, `rebind` | with the operation |
 | `deny` | when policy refuses a request |
 | `admin` | for every admin-listener action |
+| `inventory` | before a subject's fact list (ids, types, dates, no values) is released by the GDPR routes; the list is not sent until this entry is durable |
 
 ```
 body = {"principal": string, "caller": string|null, "roles": [string], "purpose": string|null,

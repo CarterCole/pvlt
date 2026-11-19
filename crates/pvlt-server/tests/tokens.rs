@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use biscuit_auth::builder::Algorithm;
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey};
 use pvlt_server::tokens::{
-    Claims, IssuerKeys, TokenError, attenuate_expiry, attenuate_with_fact, generate_issuer_key,
-    mint, public_key_of, verify,
+    Claims, IssuerKeys, MAX_REPEATS, MAX_TOKEN_LEN, TokenError, attenuate_expiry,
+    attenuate_with_fact, generate_issuer_key, mint, public_key_of, verify,
 };
 use uuid::Uuid;
 
@@ -273,6 +273,91 @@ fn attenuation_can_only_narrow_a_token() {
     assert_eq!(got.roles, ["data-subject"]);
     assert_eq!(got.caller.as_deref(), Some("user:77"));
     assert_eq!(got.resource_fact, Some(Uuid::from_bytes([5; 16])));
+}
+
+#[test]
+fn a_full_token_verifies_while_many_threads_verify_at_once() {
+    let r = rig();
+    let many = |name: &str| -> Vec<String> {
+        (0..MAX_REPEATS)
+            .map(|i| format!("{name}-{i:02}-{}", "x".repeat(16)))
+            .collect()
+    };
+    // Every claim, each repeatable one as many times as allowed, and a narrowing check: as much Datalog as a
+    // genuine token can carry.
+    let full = Claims {
+        roles: many("role"),
+        actions: many("action"),
+        grants: many("grant"),
+        ..claims()
+    };
+    let token = attenuate_expiry(&mint(&r.seed, &full).unwrap(), &r.keys, NOW + 30).unwrap();
+    assert!(token.len() <= MAX_TOKEN_LEN);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) * 2;
+    // With biscuit-auth's default 1 ms time limit, about 1 in 8 of these were refused in a debug build.
+    let refused: usize = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    (0..25)
+                        .filter(|_| verify(&token, &r.keys, NOW, TTL).as_ref() != Ok(&full))
+                        .count()
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).sum()
+    });
+    assert_eq!(refused, 0, "{refused} of {} were refused", threads * 25);
+}
+
+/// Each of these attenuation blocks passes its own check when it is small. Large, it would still pass if it ran
+/// to the end, so a refusal can only come from a run limit.
+mod hostile {
+    /// Derives one new fact per round, `n` rounds in all, with fewer than `3n` facts.
+    pub fn rounds(n: usize) -> String {
+        let edges: String = (0..n).map(|i| format!("edge({i}, {});", i + 1)).collect();
+        format!("{edges} reach(0); reach($b) <- reach($a), edge($a, $b); check if reach({n});")
+    }
+
+    /// Derives `n * n` facts in one round.
+    pub fn facts(n: usize) -> String {
+        let f: String = (0..n).map(|i| format!("f({i});")).collect();
+        format!(
+            "{f} pair($a, $b) <- f($a), f($b); check if pair({m}, {m});",
+            m = n - 1
+        )
+    }
+
+    /// `rounds(n)`, with a rule that tries `width³` combinations in every round and never matches.
+    pub fn slow(n: usize, width: usize) -> String {
+        let f: String = (0..width).map(|i| format!("f({i});")).collect();
+        format!(
+            "{} {f} never($a) <- f($a), f($b), f($c), $a + $b + $c < 0;",
+            rounds(n)
+        )
+    }
+}
+
+#[test]
+fn run_limits_still_stop_a_hostile_attenuation_block() {
+    let r = rig();
+    let token = mint(&r.seed, &claims()).unwrap();
+    let with = |code: &str| {
+        let t = attenuate_with_fact(&token, &r.keys, code).unwrap();
+        assert!(t.len() <= MAX_TOKEN_LEN);
+        verify(&t, &r.keys, NOW, TTL)
+    };
+
+    for small in [hostile::rounds(10), hostile::facts(10), hostile::slow(3, 4)] {
+        assert!(with(&small).is_ok(), "{small}");
+    }
+    // 150 rounds, against a limit of 100.
+    assert_eq!(with(&hostile::rounds(150)), Err(TokenError::Rejected));
+    // 1600 facts, against a limit of 1000.
+    assert_eq!(with(&hostile::facts(40)), Err(TokenError::Rejected));
+    // 90 rounds and about 230 facts are both inside their limits, so only the time limit can refuse this. Run to
+    // the end it takes seconds in a debug build, and then passes.
+    assert_eq!(with(&hostile::slow(90, 30)), Err(TokenError::Rejected));
 }
 
 #[test]

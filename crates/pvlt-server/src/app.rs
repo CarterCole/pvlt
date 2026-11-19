@@ -77,6 +77,43 @@ impl IssuerKeys for Access {
     }
 }
 
+/// GDPR mode (`PVLT_GDPR_MODE`): routes that answer a data subject's rights of access and portability (art. 15,
+/// art. 20). Erasure (art. 17) is always available as a subject shred. Off by default. The parts that disclose
+/// more than a normal read can each be turned off on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GdprMode {
+    /// Whether the GDPR routes are served at all.
+    pub enabled: bool,
+    /// `POST /v2/subject/export`: every readable value of one subject in a single response
+    /// (`PVLT_GDPR_EXPORT`, default on). A stolen self token then gets everything at once, not one fact at a
+    /// time, so a deployment that answers portability requests some other way can turn it off.
+    pub export: bool,
+    /// `POST /v2/admin/subject/facts`: lets an admin list a subject's facts, without values
+    /// (`PVLT_GDPR_ADMIN_INVENTORY`, default on). An admin otherwise cannot tell which facts belong to whom.
+    pub admin_inventory: bool,
+}
+
+impl GdprMode {
+    /// Everything on.
+    pub fn on() -> Self {
+        Self {
+            enabled: true,
+            export: true,
+            admin_inventory: true,
+        }
+    }
+
+    /// Whether the export route is served.
+    pub fn export_enabled(&self) -> bool {
+        self.enabled && self.export
+    }
+
+    /// Whether the admin inventory route is served.
+    pub fn admin_inventory_enabled(&self) -> bool {
+        self.enabled && self.admin_inventory
+    }
+}
+
 /// Where unsealing stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsealStatus {
@@ -110,6 +147,8 @@ pub struct App<K, O, A> {
     pub max_blob_bytes: u64,
     /// How long a presigned upload or download address lives.
     pub presign_ttl: std::time::Duration,
+    /// Which GDPR routes are served.
+    pub gdpr: GdprMode,
     access: RwLock<Arc<Access>>,
     shares: Mutex<Vec<UnsealShare>>,
     domain_ready: AtomicBool,
@@ -142,6 +181,7 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
             limiter: RateLimiter::default(),
             max_blob_bytes: pvlt_core::engine::DEFAULT_MAX_BLOB_LEN,
             presign_ttl: std::time::Duration::from_secs(900),
+            gdpr: GdprMode::default(),
             access: RwLock::new(Arc::new(Access::default())),
             shares: Mutex::new(Vec::new()),
             domain_ready: AtomicBool::new(false),
@@ -152,6 +192,12 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
     pub fn with_admins(mut self, admins: Vec<Admin>) -> Self {
         self.admins = admins;
         self
+    }
+
+    /// Whether changes to who may do what (policy, issuers) need a second admin. They do whenever there are two
+    /// admins to ask; with one, that admin's word is all there is, and the server says so at start.
+    pub fn changes_need_two_admins(&self) -> bool {
+        self.admins.len() >= 2
     }
 
     /// Sets the longest request-token lifetime and whether break-glass approvals are allowed.
@@ -169,6 +215,12 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
     ) -> Self {
         self.max_blob_bytes = max_blob_bytes;
         self.presign_ttl = presign_ttl;
+        self
+    }
+
+    /// Sets which GDPR routes are served. Routers built after this see it.
+    pub fn with_gdpr(mut self, gdpr: GdprMode) -> Self {
+        self.gdpr = gdpr;
         self
     }
 
@@ -245,6 +297,11 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
 
     /// Takes one share. When enough distinct shares have arrived it tries to unseal, and whatever the outcome
     /// it forgets them, so a wrong batch cannot be topped up one share at a time.
+    ///
+    /// A vault initialised with share checks refuses a share that is not the one dealt under its number the
+    /// moment it arrives, so nobody who can reach this route can spoil an unseal by sending a forged share first.
+    /// For an older vault without checks, a second, different share under a number already held is refused
+    /// loudly instead of being dropped, so the holder of the real one finds out at once.
     pub fn submit_share(&self, text: &str) -> Result<UnsealStatus, ApiError> {
         if !self.engine.keyring().is_sealed() {
             return Ok(self.unseal_status());
@@ -260,13 +317,27 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
         if info.threshold != self.threshold() {
             return Err(ApiError::BadRequest("share does not match this vault"));
         }
+        pvlt_core::seal::check_share(&self.seal_config, &share)?;
         let mut held = self.shares.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut have = Vec::with_capacity(held.len());
+        let mut same_number = None;
         for s in held.iter() {
-            have.push(s.info()?.index);
+            if s.info()?.index == info.index {
+                same_number = Some(s.to_text());
+            }
         }
-        if !have.contains(&info.index) && held.len() < MAX_PENDING {
-            held.push(share);
+        match same_number {
+            None if held.len() < MAX_PENDING => held.push(share),
+            None => {}
+            Some(previous)
+                if !bool::from(previous.as_bytes().ct_eq(share.to_text().as_bytes())) =>
+            {
+                return Err(ApiError::Vault(VaultError::Conflict(
+                    "a different share with this number was already submitted; seal the vault to clear \
+                     pending shares and start again",
+                )));
+            }
+            // The same share again: it is already held.
+            Some(_) => {}
         }
         let batch = if held.len() >= usize::from(self.threshold()) {
             Some(core::mem::take(&mut *held))

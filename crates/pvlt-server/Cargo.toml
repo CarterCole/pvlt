@@ -36,10 +36,10 @@ hex = "0.4"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
-pvlt-core = { path = "../pvlt-core", version = "0.1.0" }
-pvlt-format = { path = "../pvlt-format", version = "0.1.0" }
-pvlt-mem = { path = "../pvlt-mem", version = "0.1.0" }
-pvlt-policy = { path = "../pvlt-policy", version = "0.1.0" }
+pvlt-core = { path = "../pvlt-core", version = "0.2.0" }
+pvlt-format = { path = "../pvlt-format", version = "0.2.0" }
+pvlt-mem = { path = "../pvlt-mem", version = "0.2.0" }
+pvlt-policy = { path = "../pvlt-policy", version = "0.2.0" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 serde = { version = "1", features = ["derive"] }

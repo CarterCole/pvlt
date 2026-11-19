@@ -77,7 +77,9 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -addext "extendedKeyUsage=serverAuth" \
   -addext "keyUsage=digitalSignature" >/dev/null 2>&1
 
-export PVLT_DATABASE_URL="$DB_URL"
+# The URL holds a password, so it goes in a file: a default build refuses a password in the variable itself.
+printf '%s\n' "$DB_URL" > "$WORK/database-url"
+export PVLT_DATABASE_URL_FILE="$WORK/database-url"
 export PVLT_DOMAIN="5f0e5b4e-7a52-4c1c-9d6e-0c2d1f7a9b11"
 export PVLT_S3_BUCKET="pvlt" PVLT_S3_REGION="us-east-1"
 export PVLT_S3_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" PVLT_S3_ALLOW_HTTP=true PVLT_S3_PATH_STYLE=true
@@ -91,6 +93,7 @@ echo "== init"
 "$BIN" init --threshold 2 --shares 3 > "$WORK/shares" 2> "$WORK/init.err" || { echo "init failed:"; cat "$WORK/init.err"; exit 1; }
 check "init printed 3 shares" eq "$(wc -l < "$WORK/shares" | tr -d ' ')" 3
 check "init refuses to run twice" bash -c "! \"$BIN\" init --threshold 2 --shares 3 >/dev/null 2>&1"
+check "a password in PVLT_DATABASE_URL is refused" bash -c "env -u PVLT_DATABASE_URL_FILE PVLT_DATABASE_URL='$DB_URL' \"$BIN\" init 2>&1 | grep -q 'put the URL in a file'"
 SHARE1="$(sed -n 1p "$WORK/shares")"; SHARE2="$(sed -n 2p "$WORK/shares")"; SHARE3="$(sed -n 3p "$WORK/shares")"
 
 D="https://localhost:${DATA_PORT}"
@@ -116,9 +119,10 @@ echo "== serve (sealed)"
 start_server
 check "healthz answers while sealed" eq "$("${CURL[@]}" "$D/healthz")" ok
 check "readyz is 503 while sealed" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$D/readyz")" 503
-check "store is refused while sealed" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$D/api/v1/facts" \
+# No policy yet, so no compat role: the static token is refused outright (403), before sealing is even asked.
+check "store is refused before a policy gives the compat token a role" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$D/api/v1/facts" \
   -H "X-OPV-GRANT-TOKEN: $COMPAT_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"fact_type_slug":"ascii","scope_custom_id":"s","value":"v"}')" 503
+  -d '{"fact_type_slug":"ascii","scope_custom_id":"s","value":"v"}')" 403
 check "TLS 1.2 is refused" bash -c "! curl -sS --cacert '$WORK/cert.pem' --tls-max 1.2 -o /dev/null '$D/healthz' 2>/dev/null"
 check "plaintext HTTP to the TLS port gets no answer" bash -c "! curl -sS --max-time 5 -o /dev/null 'http://127.0.0.1:${DATA_PORT}/healthz' 2>/dev/null"
 
@@ -240,8 +244,13 @@ check "the rerun skips the five done and imports the one that failed" bash -c "e
 FIRST_ID="$(sed -n 1p "$WORK/opv-ids.txt")"
 check "an imported fact is readable under its original id through the compat route" eq "$("${CURL[@]}" "${H[@]}" "$D/api/v1/facts/$FIRST_ID" | json "['value']")" "Quentin Q. Nightingale"
 check "a unicode value survives" eq "$("${CURL[@]}" "${H[@]}" "$D/api/v1/facts/$(sed -n 6p "$WORK/opv-ids.txt")" | json "['value']")" "plain-ascii-six"
+grep -v 5c0de999 "$WORK/opv.csv" > "$WORK/verify.csv"   # the row OPV never had
+VERIFY=(python3 "$ROOT/scripts/verify_opv_import.py" --csv "$WORK/verify.csv" --opv-url "http://127.0.0.1:$OPV_PORT" \
+  --opv-token-file "$WORK/opv-token" --vault-url "$D" --vault-token-file "$WORK/compat-token" --cacert "$WORK/cert.pem")
+check "the independent verifier agrees with the importer" bash -c "'${VERIFY[0]}' ${VERIFY[*]:1} | grep -qx 'checked 6  ok 6  problems 0'"
 check "the imported facts are filed under their subjects (a subject shred reaches one)" eq "$("${CURL[@]}" -X POST "${AH[@]}" "$A/v2/admin/shred/subject" -d '{"subject":"user:1","reason":"migration"}' | json "['outcome']")" shredded
 check "and that one is then gone" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${H[@]}" "$D/api/v1/facts/$FIRST_ID")" 410
+check "the verifier then fails, naming the shredded fact" bash -c "! '${VERIFY[0]}' ${VERIFY[*]:1} > '$WORK/verify.out' && grep -qx 'vault $FIRST_ID: 410' '$WORK/verify.out'"
 kill "$OPV_PID" 2>/dev/null || true
 wait "$OPV_PID" 2>/dev/null || true
 check "the Python client does the three OPV calls against the real server" env PVLT_TEST_URL="$D" PVLT_TEST_COMPAT_TOKEN="$COMPAT_TOKEN" PVLT_CA_BUNDLE="$WORK/cert.pem" python3 -m unittest discover -s "$ROOT/clients/python" -p 'test_pvlt_client.py'
