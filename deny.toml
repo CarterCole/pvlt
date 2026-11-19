@@ -1,5 +1,10 @@
 [advisories]
 version = 2
+# RUSTSEC-2026-0387 (crypto-bigint 0.5.5): fixed only in 0.7.6, but elliptic-curve 0.13 (under biscuit-auth's and
+# age's P-256 support) requires ^0.5, so it cannot be updated here. pvlt never does secret P-256 arithmetic:
+# tokens use Ed25519 keys and backups use X25519 recipients. Revisit when biscuit-auth or age move to a newer
+# elliptic-curve.
+ignore = ["RUSTSEC-2026-0387"]
 
 [licenses]
 version = 2

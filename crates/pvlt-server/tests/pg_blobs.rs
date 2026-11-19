@@ -14,6 +14,11 @@ use common::{TestDb, World, fact, refused_with};
 use pvlt_core::store::{FactKind, KeyStore, LedgerAppend, ShredPlan, State, StoreError};
 use time::{Duration, OffsetDateTime};
 
+/// Postgres keeps microseconds, so a time that is compared after a round trip must not carry more.
+fn micros(t: OffsetDateTime) -> OffsetDateTime {
+    t.replace_nanosecond(t.nanosecond() / 1000 * 1000).unwrap()
+}
+
 fn append(seq: u64, prev: [u8; 32], tag: u8) -> LedgerAppend {
     LedgerAppend {
         seq,
@@ -31,7 +36,7 @@ async fn a_blob_row_is_pending_until_completed_and_completes_once_with_the_expir
     let alice = w.person(&seed, "alice").await;
     let d = seed.domain_id;
     let soon = OffsetDateTime::now_utc() + Duration::hours(1);
-    let later = OffsetDateTime::now_utc() + Duration::days(30);
+    let later = micros(OffsetDateTime::now_utc() + Duration::days(30));
     let (mut b, _) = fact(&seed, &alice, 1);
     b.expires_at = Some(soon);
     w.store()
@@ -180,7 +185,7 @@ async fn a_blob_row_survives_an_export_and_an_import() {
     let alice = w.person(&seed, "alice").await;
     let d = seed.domain_id;
     let (b, _) = fact(&seed, &alice, 1);
-    let later = OffsetDateTime::now_utc() + Duration::days(3);
+    let later = micros(OffsetDateTime::now_utc() + Duration::days(3));
     w.store()
         .insert_blob(&b, 4096, 123_456, Some(later))
         .await
