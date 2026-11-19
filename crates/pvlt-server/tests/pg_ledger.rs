@@ -547,7 +547,7 @@ async fn concurrent_shreds_through_the_engine_leave_one_verified_chain() {
 #[ignore = "needs PVLT_TEST_DATABASE_URL; run scripts/test-db.sh start"]
 async fn expiry_hold_and_rebind_work_in_the_database() {
     let r = rig().await;
-    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(5);
+    let past = common::micros(time::OffsetDateTime::now_utc()) - time::Duration::seconds(5);
     let held = r
         .engine
         .create_fact(

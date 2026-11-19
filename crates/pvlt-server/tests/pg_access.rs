@@ -34,7 +34,7 @@ fn approval(
         fact_id,
         requested_by: by.to_owned(),
         break_glass,
-        expires_at: OffsetDateTime::now_utc() + Duration::seconds(ttl_secs),
+        expires_at: common::micros(OffsetDateTime::now_utc()) + Duration::seconds(ttl_secs),
     }
 }
 
@@ -117,7 +117,7 @@ async fn an_approval_needs_a_second_person_and_works_once() {
     let other = fact(&seed, &alice, 2).0;
     w.store().insert_fact(&f).await.unwrap();
     let d = seed.domain_id;
-    let now = OffsetDateTime::now_utc();
+    let now = common::micros(OffsetDateTime::now_utc());
 
     let req = approval(d, f.fact_id, "admin-a", false, 300);
     let made = w.store().create_approval(&req).await.unwrap();
@@ -181,7 +181,7 @@ async fn an_approval_expires_and_break_glass_is_the_only_way_to_approve_alone() 
     let (f, _) = fact(&seed, &alice, 1);
     w.store().insert_fact(&f).await.unwrap();
     let d = seed.domain_id;
-    let now = OffsetDateTime::now_utc();
+    let now = common::micros(OffsetDateTime::now_utc());
 
     let short = approval(d, f.fact_id, "admin-a", false, 5);
     w.store().create_approval(&short).await.unwrap();
@@ -241,7 +241,11 @@ async fn of_many_concurrent_uses_of_one_approval_exactly_one_succeeds() {
     let req = approval(seed.domain_id, f.fact_id, "admin-a", false, 300);
     w.store().create_approval(&req).await.unwrap();
     w.store()
-        .approve(&req.id, "admin-b", OffsetDateTime::now_utc())
+        .approve(
+            &req.id,
+            "admin-b",
+            common::micros(OffsetDateTime::now_utc()),
+        )
         .await
         .unwrap();
 
@@ -251,7 +255,12 @@ async fn of_many_concurrent_uses_of_one_approval_exactly_one_succeeds() {
         let (store, id, fact_id, domain) = (Arc::clone(&store), req.id, f.fact_id, seed.domain_id);
         tasks.push(tokio::spawn(async move {
             store
-                .consume_approval(&domain, &id, &fact_id, OffsetDateTime::now_utc())
+                .consume_approval(
+                    &domain,
+                    &id,
+                    &fact_id,
+                    common::micros(OffsetDateTime::now_utc()),
+                )
                 .await
         }));
     }

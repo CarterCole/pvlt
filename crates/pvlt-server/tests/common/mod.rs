@@ -295,3 +295,9 @@ pub fn fact_id(n: u32) -> FactId {
 pub fn root_hex(w: &World) -> String {
     hex(w.root.expose())
 }
+
+/// Postgres keeps microseconds, so a time that is compared after a round trip must not carry more.
+#[allow(dead_code)]
+pub fn micros(t: time::OffsetDateTime) -> time::OffsetDateTime {
+    t.replace_nanosecond(t.nanosecond() / 1000 * 1000).unwrap()
+}

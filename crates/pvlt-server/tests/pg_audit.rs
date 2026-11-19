@@ -39,7 +39,7 @@ fn entry(seq: u64, prev: [u8; 32], tag: u8) -> AuditAppend {
         principal: "p".into(),
         fact_id: None,
         subject_hmac: None,
-        at: OffsetDateTime::now_utc(),
+        at: common::micros(OffsetDateTime::now_utc()),
     }
 }
 
@@ -348,7 +348,7 @@ async fn queries_use_the_indexes_the_columns_describe_and_agree_with_the_entries
         .len(),
         1
     );
-    let now = OffsetDateTime::now_utc();
+    let now = common::micros(OffsetDateTime::now_utc());
     assert_eq!(
         q(AuditFilter {
             from: Some(now + time::Duration::hours(1)),
