@@ -508,11 +508,12 @@ fn share_checks_from_bytes(bytes: Option<Vec<u8>>) -> Result<Vec<(u8, [u8; 32])>
     let Some(bytes) = bytes else {
         return Ok(Vec::new());
     };
-    if bytes.is_empty() || bytes.len() % 33 != 0 {
+    let (records, rest) = bytes.as_chunks::<33>();
+    if records.is_empty() || !rest.is_empty() {
         return Err(StoreError::Corrupt("share checks length"));
     }
-    bytes
-        .chunks_exact(33)
+    records
+        .iter()
         .map(|c| {
             let (x, h) = c
                 .split_first()
