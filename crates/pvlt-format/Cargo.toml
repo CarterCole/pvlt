@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
-categories = ["cryptography::algorithms", "cryptography"]
+categories = ["cryptography"]
 readme = "README.md"
 # The vectors live in the repository's spec/ directory, outside this crate, so this test cannot run from a package.
 exclude = ["tests/vectors.rs"]
