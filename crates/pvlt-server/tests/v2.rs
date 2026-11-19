@@ -1765,10 +1765,9 @@ async fn a_truncated_audit_log_stops_reads_and_readiness_until_an_admin_acknowle
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read(&r, id, &verifier()).await.0, StatusCode::OK);
-    assert_eq!(
-        call(&r.data, Method::GET, "/readyz", None, None).await.0,
-        StatusCode::OK
-    );
+    // The audit log no longer blocks readiness. (This rig's policy has no compat role, which has its own check.)
+    let (_, ready, _) = call(&r.data, Method::GET, "/readyz", None, None).await;
+    assert_eq!(ready["audit_ok"], json!(true));
     // And it is on the record, by name.
     assert!(audit_rows(&r).await.iter().any(|(k, p, b)| k == "admin"
         && p == "bob"

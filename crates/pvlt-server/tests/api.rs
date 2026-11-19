@@ -409,6 +409,7 @@ async fn neither_store_holds_the_value_or_scope_after_http_calls() {
 #[tokio::test]
 async fn a_sealed_vault_says_so_and_unsealing_needs_enough_distinct_good_shares() {
     let r = rig(false, true, 1_048_576);
+    allow_compat(&r).await;
 
     let (status, body, _) = store(&r, "ascii", "s", "v").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -565,6 +566,7 @@ async fn the_admin_routes_are_not_on_the_data_router_and_the_data_routes_not_on_
 #[tokio::test]
 async fn readyz_reports_the_memory_protections_and_the_build() {
     let r = default_rig();
+    allow_compat(&r).await;
     let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ready"], true);
@@ -587,6 +589,43 @@ async fn error_responses_carry_only_a_code_and_a_fixed_message() {
 
 fn admin_auth() -> [(&'static str, String); 1] {
     [("Authorization", format!("Bearer {ADMIN}"))]
+}
+
+const COMPAT_POLICY: &str = r#"{"version":1,"roles":{"compat":{"allow":[{"types":["ascii","base64","json"],"actions":["create","read","shred"]}]}}}"#;
+
+/// Installs a policy with a `compat` role. A compat token with no such role makes `/readyz` report not ready.
+async fn allow_compat(r: &Rig) {
+    let h = admin_auth();
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/v2/admin/policy")
+        .header(h[0].0, h[0].1.as_str())
+        .body(Body::from(COMPAT_POLICY))
+        .unwrap();
+    let res = r.admin.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_compat_token_without_a_compat_role_is_not_ready_and_the_role_makes_it_ready() {
+    let r = default_rig();
+    let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
+    assert_eq!(
+        (status, body["compat_policy"].clone(), body["ready"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!(false), json!(false))
+    );
+    allow_compat(&r).await;
+    let (status, body, _) = call(&r.data, Method::GET, "/readyz", &[], None).await;
+    assert_eq!(
+        (status, body["compat_policy"].clone(), body["ready"].clone()),
+        (StatusCode::OK, json!(true), json!(true))
+    );
+    // No compat token configured: nothing to narrow, so no policy is needed.
+    let none = rig(true, false, 1_048_576);
+    assert_eq!(
+        call(&none.data, Method::GET, "/readyz", &[], None).await.0,
+        StatusCode::OK
+    );
 }
 
 async fn admin_post(r: &Rig, path: &str, body: Value) -> (StatusCode, Value, String) {
@@ -617,9 +656,64 @@ async fn the_admin_shred_routes_need_the_admin_token_and_nothing_else_works_as_a
 }
 
 #[tokio::test]
+async fn compat_subjects_may_be_colon_ids_with_a_length_cap_and_one_subject_shred_covers_only_its_facts()
+ {
+    let r = default_rig();
+    let create = |subject: String| {
+        let data = r.data.clone();
+        async move {
+            call(
+                &data,
+                Method::POST,
+                "/api/v1/facts",
+                &[("X-OPV-GRANT-TOKEN", TOKEN)],
+                Some(json!({"fact_type_slug":"ascii","scope_custom_id":"kyc","value":"v","subject_custom_id":subject})),
+            )
+            .await
+        }
+    };
+    let (s1, b1, _) = create("user:123".to_owned()).await;
+    let (s2, b2, _) = create("performer:456".to_owned()).await;
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+    let (id_user, id_performer) = (b1["id"].as_str().unwrap(), b2["id"].as_str().unwrap());
+
+    // 256 bytes is allowed, 257 is refused with a fixed message and nothing is stored.
+    assert_eq!(create("u".repeat(256)).await.0, StatusCode::OK);
+    let (status, body, raw) = create("u".repeat(257)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!raw.contains(&"u".repeat(257)));
+
+    let (status, body, _) = admin_post(
+        &r,
+        "/v2/admin/shred/subject",
+        json!({"subject":"user:123","reason":"subject_request"}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["outcome"].clone()),
+        (StatusCode::OK, json!("shredded"))
+    );
+    let get = |id: &str| {
+        let data = r.data.clone();
+        let path = format!("/api/v1/facts/{id}");
+        async move { call(&data, Method::GET, &path, &auth(), None).await.0 }
+    };
+    assert_eq!(get(id_user).await, StatusCode::GONE);
+    assert_eq!(get(id_performer).await, StatusCode::OK);
+    let (status, ..) = admin_post(
+        &r,
+        "/v2/admin/shred/subject",
+        json!({"subject": "u".repeat(257)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn a_subject_shred_through_the_admin_route_destroys_the_subjects_facts_and_writes_the_ledger()
 {
     let r = default_rig();
+    allow_compat(&r).await;
     let create = |subject: &'static str, scope: &'static str, value: &'static str| {
         let data = r.data.clone();
         async move {

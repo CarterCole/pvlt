@@ -510,6 +510,12 @@ impl Policy {
         Decision::Deny(best)
     }
 
+    /// Whether the policy defines the `compat` role, which is what narrows the static compat token. Without it
+    /// that token may do anything.
+    pub fn has_compat_role(&self) -> bool {
+        self.roles.contains_key(COMPAT_ROLE)
+    }
+
     /// Decides a request for the static compat token, which runs as the role named `compat`. If the policy has
     /// no such role the request is **allowed with no limits**, which is what the compat routes did before there
     /// was a policy: a deployment that wants the compat token narrowed defines the role.

@@ -55,7 +55,10 @@ where
     let ledger = key_store && objects && app.engine.ledger_in_sync().await.unwrap_or(false);
     // Reads stop while the audit log has lost entries nobody has acknowledged (REQUIREMENTS 3.9).
     let audit = !app.engine.audit_blocked();
-    let ready = !sealed && key_store && objects && ledger && audit;
+    // A compat token with no `compat` role in the policy may do anything, so the safe configuration is the only
+    // one that reports ready: set a policy with that role, or unset the token.
+    let compat_policy = app.compat_token.is_none() || app.access().policy.has_compat_role();
+    let ready = !sealed && key_store && objects && ledger && audit && compat_policy;
     let report = app.engine.keyring().arena().report();
     let body = json!({
         "ready": ready,
@@ -64,6 +67,7 @@ where
         "object_store": objects,
         "ledger_in_sync": ledger,
         "audit_ok": audit,
+        "compat_policy": compat_policy,
         "memory": {
             "locked": report.locked,
             "excluded_from_dumps": report.excluded_from_dumps,

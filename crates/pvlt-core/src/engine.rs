@@ -72,6 +72,9 @@ pub struct FactMeta {
 /// Longest fact type slug, in bytes.
 pub const MAX_FACT_TYPE_LEN: usize = 64;
 
+/// The longest subject, in bytes. Subjects are opaque ids like `user:123`; this only stops abuse.
+pub const MAX_SUBJECT_LEN: usize = 256;
+
 /// How many times a shred re-reads and retries when the ledger moves under it. Shreds of one domain take turns,
 /// and every round one of them wins, so a burst of N concurrent shreds needs up to N rounds. Shreds are rare, so
 /// the quadratic work in a burst is accepted.
@@ -375,6 +378,9 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
         }
         if request.subject.is_some_and(str::is_empty) {
             return Err(VaultError::Invalid("subject is empty"));
+        }
+        if request.subject.is_some_and(|s| s.len() > MAX_SUBJECT_LEN) {
+            return Err(VaultError::Invalid("subject too long"));
         }
         let type_len = request.fact_type.len();
         if type_len == 0 || type_len > MAX_FACT_TYPE_LEN {
@@ -760,8 +766,8 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> Engine<K, O, A> {
     ) -> Result<ShredSubject, VaultError> {
         let caller = caller.into();
         let principal = caller.principal;
-        if subject.is_empty() {
-            return Err(VaultError::Invalid("subject is empty"));
+        if subject.is_empty() || subject.len() > MAX_SUBJECT_LEN {
+            return Err(VaultError::Invalid("subject is empty or too long"));
         }
         let result = self
             .run_shred(domain_id, reason, Target::Subject(subject))

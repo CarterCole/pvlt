@@ -59,7 +59,7 @@ curl --cacert cert.pem https://localhost:8444/v2/sys/unseal -d '{"share":"pvlt-s
 
 Repeat with different shares until `"sealed": false`. A restart is sealed again and needs the shares again.
 `POST /v2/sys/seal` (admin token) wipes the keys without stopping the process. `GET /readyz` on the data listener
-says which part is not ready: `sealed`, `key_store`, `object_store`, `ledger_in_sync`, `audit_ok`.
+says which part is not ready: `sealed`, `key_store`, `object_store`, `ledger_in_sync`, `audit_ok`, `compat_policy`.
 
 **While sealed** the server answers `/healthz`, can replay the ledger and publish pending entries, and refuses
 everything else. Creating, reading **and shredding** need it unsealed: a ledger entry is signed with a key the
@@ -108,7 +108,7 @@ wrong thing), stored in canonical form with its SHA-256 (which every audit entry
 
 `PUT /v2/admin/policy` (admin) replaces it and takes effect at once on that server, and within 30 seconds on
 others. Conditions are `self` (the token's caller is its subject and the fact is filed under that subject) and
-`grant:<name>`. A role named `compat` governs the static `/api/v1` token; without one that token may do anything.
+`grant:<name>`. A role named `compat` governs the static `/api/v1` token; without one that token may do anything, so while `PVLT_COMPAT_TOKEN_FILE` is set and the policy has no `compat` role, `/readyz` reports `compat_policy: false` and not ready. The actions are `create`, `read`, `shred` and `rebind`; `DELETE /api/v1/facts/{id}` is `shred`. Subjects are limited to 256 bytes.
 With no policy at all, `/v2` refuses everything.
 
 **Dual control.** Reading a `restricted_types` fact needs an approval: one admin `POST /v2/admin/approvals
@@ -204,7 +204,9 @@ Python client. It removes both containers.
 * **Production gates** (DECISIONS.md): the Linux paths of `pvlt-mem` (locked memory, core dumps) have only been
   compiled, never run; there is no independent cryptography review; the format is not frozen; WAL archiving and
   volume encryption under Postgres are operations work.
-* No container image or Compose file, and no CI workflow, yet.
+* The `Dockerfile` builds (the default feature set, distroless, non-root), and a tagged release pushes it to
+  `ghcr.io/<owner>/pvlt`. `compose.yaml` is an example only and has never been run end to end; the image has never run
+  in a real deployment. CI and the release workflow have never run on GitHub.
 * No KMS root-key provider (Shamir only), no certificate reload, no per-statement database timeouts, no separate
   database role for migrations.
 * `pvlt unseal` and `pvlt seal` are HTTP calls, not commands.

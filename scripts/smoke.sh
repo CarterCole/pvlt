@@ -125,7 +125,12 @@ check "plaintext HTTP to the TLS port gets no answer" bash -c "! curl -sS --max-
 echo "== unseal"
 check "one share leaves it sealed" eq "$(unseal "$SHARE1" | json "['sealed']")" True
 check "a second share unseals" eq "$(unseal "$SHARE3" | json "['sealed']")" False
-check "readyz is 200 once unsealed" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$D/readyz")" 200
+check "readyz is 503 while the compat token has no compat role" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$D/readyz")" 503
+COMPAT_ROLE='"compat":{"allow":[{"types":["*"],"actions":["create","read","shred"]}]}'
+printf '{"version":1,"roles":{%s}}' "$COMPAT_ROLE" > "$WORK/policy-compat.json"
+check "a policy with a compat role is set" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X PUT "$A/v2/admin/policy" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  --data-binary @"$WORK/policy-compat.json")" 200
+check "readyz is 200 once unsealed and the compat role exists" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$D/readyz")" 200
 
 echo "== the three OPV calls"
 SECRET="Quentin-Nightingale-1987-03-09"
@@ -162,7 +167,7 @@ AH=(-H "Authorization: Bearer $ADMIN_TOKEN")
 KEY_ID="$("${CURL[@]}" -X POST "$A/v2/admin/issuers" "${AH[@]}" -d "{\"name\":\"smoke\",\"public_key\":\"$ISSUER_PUB\",\"roles\":[\"app-backend\",\"verifier\"]}" | json "['key_id']")"
 check "an issuer was registered" eq "$KEY_ID" 1
 check "a policy was set" eq "$("${CURL[@]}" -o /dev/null -w '%{http_code}' -X PUT "$A/v2/admin/policy" "${AH[@]}" \
-  -d '{"version":1,"roles":{"app-backend":{"allow":[{"types":["*"],"actions":["create","shred"]}]},"verifier":{"allow":[{"types":["identity"],"actions":["read"]}],"require":{"purposes":["kyc-review"],"reason":true}}}}')" 200
+  -d '{"version":1,"roles":{'"$COMPAT_ROLE"',"app-backend":{"allow":[{"types":["*"],"actions":["create","shred"]}]},"verifier":{"allow":[{"types":["identity"],"actions":["read"]}],"require":{"purposes":["kyc-review"],"reason":true}}}}')" 200
 SVC="$("$BIN" mint-token --seed-file "$WORK/issuer-seed" --key-id "$KEY_ID" --role app-backend --ttl 60)"
 V2ID="$("${CURL[@]}" -X POST "$D/v2/facts" -H "Authorization: Bearer $SVC" \
   -d '{"type":"identity","scope":"kyc-doc:7","subject":"user:7","value":"v2-secret-value"}' | json "['id']")"
