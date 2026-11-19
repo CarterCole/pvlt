@@ -1,9 +1,12 @@
 # Actions and base images are pinned to exact commits and digests; this keeps the pins from going stale.
 version: 2
 updates:
+  # One pull request for all the actions: separately they hit Dependabot's limit of five open, and the rest wait.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    groups:
+      actions: { patterns: ["*"] }
   - package-ecosystem: docker
     directory: /
     schedule: { interval: weekly }
