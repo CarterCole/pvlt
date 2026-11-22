@@ -388,7 +388,7 @@ async fn attenuation_narrows_a_token_and_cannot_add_a_role() {
         .0,
         StatusCode::UNAUTHORIZED
     );
-    // A holder who adds a role in a later block gains nothing.
+    // A holder who adds a role in a later block gains nothing: a later block that holds a fact is refused.
     let plain = token(&r, &claims(&["data-subject"]));
     let sneaky = pvlt_server::tokens::attenuate_with_fact(
         &plain,
@@ -406,7 +406,7 @@ async fn attenuation_narrows_a_token_and_cannot_add_a_role() {
         )
         .await
         .0,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
 }
 

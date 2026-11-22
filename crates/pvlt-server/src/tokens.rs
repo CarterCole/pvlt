@@ -22,16 +22,45 @@
 //! | `grant("..")` | a capability granted elsewhere, such as `order_open` (repeatable) | no |
 //! | `approval("..")` | the id of a dual-control approval | no |
 //!
-//! Later blocks can only **narrow** a token (add `check if ...`); their facts are never read, so a holder cannot
-//! add a role by attenuating. The issuer is identified by the token's root key id, which the registry maps to a
-//! public key. A token with no key id, an unknown key id, a bad signature, no `expires`, or an `expires` further
-//! than `max_ttl` away is refused.
+//! The issuer is identified by the token's root key id, which the registry maps to a public key. A token with no
+//! key id, an unknown key id, a bad signature, no `expires`, or an `expires` further than `max_ttl` away is
+//! refused. `expires` is read from the authority block before any Datalog runs, so an expired token costs no more
+//! than its signatures.
+//!
+//! # Attenuation
+//!
+//! Any holder can append blocks, and later blocks can only **narrow** a token: they may hold checks and nothing
+//! else. A block after the authority block that holds a fact or a rule is refused, so a holder cannot add a role
+//! by attenuating. Every check in a token must pass, at the time `verify` is given.
+//!
+//! These limits are enforced on the blocks after the authority block before any Datalog runs. A token that goes
+//! past any of them is refused as [`TokenError::Rejected`]:
+//!
+//! | What | Limit |
+//! |---|---|
+//! | facts and rules | none at all |
+//! | checks (`check if`, `check all`, `reject if`) | [`MAX_ATTENUATION_CHECKS`] in all the later blocks together |
+//! | `or` alternatives in one check | [`MAX_CHECK_ALTERNATIVES`] |
+//! | predicates in one alternative, such as `time($t)` or `action("read")` | [`MAX_QUERY_PREDICATES`] |
+//! | size of one alternative: one per predicate term and per expression operation, plus one per element of a set, array or map | [`MAX_QUERY_SIZE`] |
+//! | `.all()`, `.any()` and `.matches()` | not allowed |
+//!
+//! **For issuers and holders:** a narrowing check over three or more claims has to be split into separate checks.
+//! `check if time($t), action("read"), resource_scope("kyc-doc:42"), $t < 2026-01-01T00:00:00Z` is refused;
+//! `check if time($t), $t < 2026-01-01T00:00:00Z; check if action("read"); check if resource_scope("kyc-doc:42");`
+//! says the same and passes. Splitting only changes the meaning when one expression compares values from three
+//! claims at once, and no claim here needs that.
+//!
+//! Why: biscuit-auth reads its time limit only between check queries and between rounds of rules, and its fact
+//! limit only after a whole round. A single query that joins many predicates, or loops over a collection with
+//! `.all()` / `.any()`, or compiles a regex for every match, runs to the end whatever the limits say. These rules
+//! keep every query a holder can add small, so the time limit can stop a long run of them.
 
 use core::fmt;
 use core::time::Duration;
 
 use biscuit_auth::builder::{
-    Algorithm, AuthorizerBuilder, BiscuitBuilder, BlockBuilder, Fact, Term,
+    Algorithm, AuthorizerBuilder, Binary, BiscuitBuilder, BlockBuilder, Fact, Op, Rule, Term,
 };
 use biscuit_auth::{
     AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, RootKeyProvider, error,
@@ -45,22 +74,38 @@ pub const MAX_CLAIM_LEN: usize = 256;
 /// The most values a repeatable claim may have.
 pub const MAX_REPEATS: usize = 32;
 
-// Run limits for a token's Datalog. Anyone holding a token can append a block of rules and checks, so these
-// are what stop a hostile block from making the vault work without end. A genuine token holds about a hundred
-// facts at most (ten single claims, three repeatable ones up to `MAX_REPEATS` each, and `time`) and needs one
-// round of rule evaluation, so the fact and round limits sit far above it.
+// Run limits for a token's Datalog. Blocks a holder adds hold only checks, each kept small by the attenuation
+// limits below, so what these limits stop is a long run of such checks, and rules in the authority block. A
+// genuine token holds about a hundred facts at most (ten single claims, three repeatable ones up to
+// `MAX_REPEATS` each, and `time`) and needs one round of rule evaluation, so the fact and round limits sit far
+// above it.
 //
 // The time limit is wall-clock time, so it also counts time the thread spends waiting for a CPU. biscuit-auth's
 // default of 1 ms refused genuine tokens when the machine was busy: with 32 threads verifying a token that
 // carries every claim, about 1 in 8 were refused in a debug build. 50 ms tolerates that and still bounds a block
 // that keeps deriving facts round after round. biscuit-auth reads the clock only between rounds and between
-// check queries, so a single costly round or a check with a large join can run past it.
+// check queries, so a single costly round or a check with a large join can run past it. That is why blocks after
+// the authority block are bounded before anything runs.
 /// The most facts a token's Datalog may hold before it is refused.
 pub const MAX_FACTS: u64 = 1000;
 /// The most rounds of rule evaluation a token may need before it is refused.
 pub const MAX_ITERATIONS: u64 = 100;
 /// The longest the token's rules and checks may run, together, before it is refused.
 pub const MAX_TIME: Duration = Duration::from_millis(50);
+
+// Attenuation limits, enforced on every block after the authority block before any Datalog runs (see the module
+// docs). A check in a later block can join only the authority block's facts and `time`: at most `MAX_REPEATS` of
+// each claim in a genuine token. Two predicates over a full token is 32 x 32 = 1024 matches, measured at 7.5 ms in
+// a debug build; three would be 32 768, at 127 ms, for a single query that the time limit cannot interrupt.
+/// The most checks all the blocks after the authority block may hold together.
+pub const MAX_ATTENUATION_CHECKS: usize = 32;
+/// The most `or` alternatives one check in a later block may have.
+pub const MAX_CHECK_ALTERNATIVES: usize = 4;
+/// The most predicates one alternative of a check in a later block may join.
+pub const MAX_QUERY_PREDICATES: usize = 2;
+/// The largest one alternative of a check in a later block may be: one per predicate term and per expression
+/// operation, plus one per element of a set, array or map.
+pub const MAX_QUERY_SIZE: usize = 64;
 
 fn run_limits() -> AuthorizerLimits {
     AuthorizerLimits {
@@ -213,9 +258,120 @@ fn at_most_one(mut v: Vec<String>, name: &'static str) -> Result<Option<String>,
     }
 }
 
+fn check_lifetime(expires: i64, now: i64, max_ttl: i64) -> Result<(), TokenError> {
+    if expires <= now {
+        return Err(TokenError::Expired);
+    }
+    if expires.saturating_sub(now) > max_ttl {
+        return Err(TokenError::LifetimeTooLong);
+    }
+    Ok(())
+}
+
+/// One block of a token, read back as Datalog. biscuit-auth keeps its parsed blocks private, so the block is
+/// printed and parsed again; a block that does not survive that is not one this module can bound.
+fn block_code(biscuit: &Biscuit, index: usize) -> Option<BlockBuilder> {
+    let source = biscuit.print_block_source(index).ok()?;
+    BlockBuilder::new().code(source).ok()
+}
+
+/// Refuses an expired or too long-lived token from the authority block's `expires` fact alone, before any Datalog
+/// runs, so only the holder of a live token can make the vault run a block they added. A missing or repeated
+/// `expires` is left to the read after `authorize`, which reports it.
+fn expiry_first(biscuit: &Biscuit, now: i64, max_ttl: i64) -> Result<(), TokenError> {
+    let Some(authority) = block_code(biscuit, 0) else {
+        return Ok(());
+    };
+    let mut found = authority
+        .facts
+        .iter()
+        .filter(|f| f.predicate.name == "expires");
+    if let (Some(fact), None) = (found.next(), found.next())
+        && let [Term::Integer(expires)] = fact.predicate.terms.as_slice()
+    {
+        check_lifetime(*expires, now, max_ttl)?;
+    }
+    Ok(())
+}
+
+fn term_size(term: &Term) -> usize {
+    match term {
+        Term::Set(set) => set.iter().map(term_size).fold(1, usize::saturating_add),
+        Term::Array(array) => array.iter().map(term_size).fold(1, usize::saturating_add),
+        Term::Map(map) => map
+            .values()
+            .map(|v| term_size(v).saturating_add(1))
+            .fold(1, usize::saturating_add),
+        _ => 1,
+    }
+}
+
+/// The size of one expression operation, or `None` for an operation a later block may not use: a closure that
+/// runs once for each element of a collection (`.all()`, `.any()`), or `.matches()`, which compiles its regex
+/// every time it is evaluated. `&&`, `||` and `.try_or()` are closures without parameters, which run at most once.
+fn op_size(op: &Op) -> Option<usize> {
+    match op {
+        Op::Value(term) => Some(term_size(term)),
+        Op::Unary(_) => Some(1),
+        Op::Binary(Binary::All | Binary::Any | Binary::Regex) => None,
+        Op::Binary(_) => Some(1),
+        Op::Closure(params, _) if !params.is_empty() => None,
+        Op::Closure(_, ops) => ops
+            .iter()
+            .try_fold(1, |n: usize, op| Some(n.saturating_add(op_size(op)?))),
+    }
+}
+
+fn bounded_query(query: &Rule) -> Result<(), TokenError> {
+    if query.body.len() > MAX_QUERY_PREDICATES {
+        return Err(TokenError::Rejected);
+    }
+    let terms = query
+        .body
+        .iter()
+        .flat_map(|p| &p.terms)
+        .map(term_size)
+        .fold(0, usize::saturating_add);
+    let size = query
+        .expressions
+        .iter()
+        .flat_map(|e| &e.ops)
+        .try_fold(terms, |n, op| Some(n.saturating_add(op_size(op)?)))
+        .ok_or(TokenError::Rejected)?;
+    if size > MAX_QUERY_SIZE {
+        return Err(TokenError::Rejected);
+    }
+    Ok(())
+}
+
+/// Refuses a token whose blocks after the authority block hold anything but small checks (see the module docs),
+/// before any of it runs.
+fn bounded_attenuation(biscuit: &Biscuit) -> Result<(), TokenError> {
+    let mut checks: usize = 0;
+    for index in 1..biscuit.block_count() {
+        let block = block_code(biscuit, index).ok_or(TokenError::Rejected)?;
+        if !block.facts.is_empty() || !block.rules.is_empty() {
+            return Err(TokenError::Rejected);
+        }
+        checks = checks.saturating_add(block.checks.len());
+        if checks > MAX_ATTENUATION_CHECKS {
+            return Err(TokenError::Rejected);
+        }
+        for check in &block.checks {
+            if check.queries.len() > MAX_CHECK_ALTERNATIVES {
+                return Err(TokenError::Rejected);
+            }
+            check.queries.iter().try_for_each(bounded_query)?;
+        }
+    }
+    Ok(())
+}
+
 /// Verifies a base64 token against the issuer registry at time `now` (unix seconds), and reads its claims.
 ///
 /// Every check inside the token, including any added by attenuation, is run with the time fact set to `now`.
+/// Before any of them runs, an expired token is refused, and so is one whose later blocks hold anything but
+/// small checks (see the module docs).
 pub fn verify(
     token: &str,
     keys: &impl IssuerKeys,
@@ -231,6 +387,8 @@ pub fn verify(
         _ => TokenError::Malformed,
     })?;
     let issuer_key_id = biscuit.root_key_id().ok_or(TokenError::UnknownIssuer)?;
+    expiry_first(&biscuit, now, max_ttl)?;
+    bounded_attenuation(&biscuit)?;
 
     let mut authorizer = AuthorizerBuilder::new()
         .code(format!("time({});", rfc3339(now)?))
@@ -238,7 +396,7 @@ pub fn verify(
         .map(|b| b.set_limits(run_limits()))
         .and_then(|b| b.build(&biscuit))
         .map_err(|_| TokenError::Rejected)?;
-    // Runs the authority block's and every later block's rules and checks, all within `run_limits`.
+    // Runs the authority block's rules and checks, and every later block's checks, all within `run_limits`.
     authorizer.authorize().map_err(|_| TokenError::Rejected)?;
 
     let expires: Vec<(i64,)> = claim_query(&mut authorizer, "data($x) <- expires($x)")?;
@@ -247,12 +405,7 @@ pub fn verify(
         [] => return Err(TokenError::Missing("expires")),
         _ => return Err(TokenError::Invalid("expires")),
     };
-    if expires <= now {
-        return Err(TokenError::Expired);
-    }
-    if expires - now > max_ttl {
-        return Err(TokenError::LifetimeTooLong);
-    }
+    check_lifetime(expires, now, max_ttl)?;
 
     let request_id = at_most_one(strings(&mut authorizer, "request_id")?, "request_id")?
         .ok_or(TokenError::Missing("request_id"))?;
@@ -375,8 +528,9 @@ pub fn attenuate_expiry(
         .map_err(|_| TokenError::Invalid("token"))
 }
 
-/// Adds a block that **claims** a role. The vault never reads facts from added blocks, so this has no effect;
-/// it exists so tests can prove that.
+/// Adds a block of any Datalog, such as one that **claims** a role, as any holder can. The vault refuses a token
+/// whose added block holds a fact or a rule, or a check past the attenuation limits; this exists so tests can
+/// prove that.
 pub fn attenuate_with_fact(
     token: &str,
     keys: &impl IssuerKeys,
