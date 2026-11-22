@@ -328,6 +328,30 @@ start_server
 check "and a restart is sealed again" eq "$("${CURL[@]}" "$A/v2/sys/status" | json "['sealed']")" True
 unset PVLT_KMS_KEY_ID PVLT_KMS_ENDPOINT PVLT_KMS_ALLOW_HTTP AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
+echo "== pvlt unseal: shares sent from another machine after a reboot"
+printf '%s\n' "$SHARE1" > "$WORK/s1"; printf '%s\n' "$SHARE3" > "$WORK/s3"; chmod 600 "$WORK/s1" "$WORK/s3"
+printf 'pvlt-share-v1:not-a-share\n' > "$WORK/s-bad"
+UNSEAL=("$BIN" unseal --admin-url "$A" --cacert "$WORK/cert.pem")
+check "a damaged share is refused before anything is sent" bash -c "! '${UNSEAL[0]}' ${UNSEAL[*]:1} --share-file '$WORK/s-bad' 2>/dev/null"
+check "still sealed after that" eq "$("${CURL[@]}" "$A/v2/sys/status" | json "['sealed']")" True
+check "one share is not enough and says so" bash -c "out=\$('${UNSEAL[0]}' ${UNSEAL[*]:1} --share-file '$WORK/s1' 2>&1) && exit 1; echo \"\$out\" | grep -q 'needs 2'"
+check "plain http is refused: the shares would cross it" bash -c "out=\$('$BIN' unseal --admin-url http://127.0.0.1:1 --share-file '$WORK/s1' 2>&1) && exit 1; echo \"\$out\" | grep -q 'must be https'"
+stop_server
+start_server
+check "unseal sends the shares and the server opens" bash -c "'${UNSEAL[0]}' ${UNSEAL[*]:1} --share-file '$WORK/s1' --share-file '$WORK/s3' 2>&1 | grep -q 'unsealed with 2 share'"
+check "the server is unsealed" eq "$("${CURL[@]}" "$A/v2/sys/status" | json "['sealed']")" False
+check "running it again leaves an unsealed server alone" bash -c "'${UNSEAL[0]}' ${UNSEAL[*]:1} --share-file '$WORK/s1' --share-file '$WORK/s3' 2>&1 | grep -q 'already unsealed'"
+check "the data survives" eq "$("${CURL[@]}" "${H[@]}" "$D/api/v1/facts/$ID2" | json "['value']")" '{"k":[1,2]}'
+stop_server
+( "${UNSEAL[@]}" --share-file "$WORK/s1" --share-file "$WORK/s3" --wait-secs 40 > "$WORK/wait.out" 2>&1; echo $? > "$WORK/wait.code" ) &
+WAIT_PID=$!
+sleep 4
+start_server
+wait "$WAIT_PID" || true
+check "--wait-secs waits for a server that is not up yet, then unseals it" bash -c "grep -q 'unsealed with 2 share' '$WORK/wait.out' && [ \"\$(cat '$WORK/wait.code')\" = 0 ]"
+check "no share is in the server log" bash -c "! grep -q 'pvlt-share-v1' '$WORK/serve.log'"
+rm -f "$WORK/s1" "$WORK/s3" "$WORK/s-bad"
+
 stop_server
 echo
 echo "passed=$PASS failed=$FAIL  (postgres image: $PG_IMAGE_NOTE, minio image: $MINIO_IMAGE)"

@@ -70,6 +70,28 @@ says which part is not ready: `sealed`, `key_store`, `object_store`, `ledger_in_
 everything else. Creating, reading **and shredding** need it unsealed: a ledger entry is signed with a key the
 root key unwraps, so erasure waits for an unseal.
 
+## Unsealing from a laptop (no KMS)
+
+`pvlt unseal` sends shares, read from files, to the admin listener, so one machine can unseal the server after
+every reboot without anyone typing. It needs only the `pvlt` binary (`cargo install pvlt-server` gives you
+`pvlt`) and the server's certificate if it is not from a public CA.
+
+```bash
+# once: put enough shares (the threshold, e.g. 2) in files, one share per file, mode 600, on an encrypted disk
+pvlt unseal --admin-url https://pvlt.internal:8444 --cacert pvlt-ca.pem \
+  --share-file ~/.pvlt/share1 --share-file ~/.pvlt/share2 --wait-secs 600
+```
+
+* It checks every share locally first, so a typo fails before anything is sent.
+* It is safe to repeat: an already unsealed server is left alone, so it can run from a login item, a `launchd` job
+  or cron on a timer. `--wait-secs N` keeps trying for N seconds while the server is down or starting.
+* The admin URL must be `https://`, because the shares cross it. Shares are never printed or logged.
+* **What this trades.** A machine that holds the threshold's worth of shares *is* the unseal key: whoever has the
+  laptop (and its disk key) can open the vault, and the server cannot restart unattended while the laptop is off.
+  It is still better than shares on the server itself, because a stolen server disk gets nobody in. To keep two
+  people in the loop, leave one share with another person or device and let the laptop hold the rest (with a
+  threshold of 3 of 5, say: two on the laptop, one with someone else).
+
 ## Auto-unseal
 
 By default every restart is sealed until enough people send their shares. With **auto-unseal** the server unseals
@@ -323,7 +345,7 @@ Python client. It removes both containers.
   `/api/v1`.
 * Auto-unseal supports AWS KMS only (no GCP, Azure or Vault), no certificate reload, no per-statement database timeouts, no separate
   database role for migrations.
-* `pvlt unseal` and `pvlt seal` are HTTP calls, not commands.
+* `pvlt seal` is an HTTP call (`POST /v2/sys/seal`), not a command; `pvlt unseal` is a command (below).
 * Blob upload from Python (client-side encryption) is not in the Python client.
 * Rate limits are per server and in memory. Group commit for the audit log is per server; two servers share one
   chain by retrying, which costs throughput under heavy contention.

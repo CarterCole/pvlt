@@ -45,6 +45,9 @@ const USAGE: &str = "usage:
                                             --kms also enrols auto-unseal (needs PVLT_KMS_KEY_ID)
   pvlt serve                                start the server; unseals through the KMS if enrolled,
                                             else sealed until POST /v2/sys/unseal
+  pvlt unseal --share-file F... [--admin-url URL] [--cacert PEM]... [--wait-secs N]
+                                            send shares to a sealed server (from a laptop, after a reboot);
+                                            --wait-secs waits for the server to come up; safe to repeat
   pvlt kms-enroll --share-file F...         wrap the unseal key with the KMS (enough shares, one file each)
   pvlt kms-remove                           forget the KMS copy; shares remain the only way to unseal
   pvlt backup --out FILE --recipient R... --signing-key-file FILE
@@ -90,6 +93,7 @@ fn main() -> ExitCode {
     let rest = args.get(1..).unwrap_or_default();
     let outcome = match args.first().map(String::as_str) {
         Some("init") => runtime.block_on(init(rest)),
+        Some("unseal") => runtime.block_on(unseal_cmd(rest)),
         Some("kms-enroll") => runtime.block_on(kms_enroll_cmd(rest)),
         Some("kms-remove") if args.len() == 1 => runtime.block_on(kms_remove_cmd()),
         Some("serve") if args.len() == 1 => runtime.block_on(run()),
@@ -356,6 +360,138 @@ async fn kms_enroll_cmd(args: &[String]) -> Result<(), String> {
     drop(shares);
     let kms = AwsKms::new(kms_config).await;
     enroll_and_check(&store, &kms, &seal, &key).await
+}
+
+/// `pvlt unseal`: sends shares, read from files, to a sealed server's admin listener, so a laptop (or a job on
+/// one) can unseal after a reboot without anyone typing. It is safe to run again: an unsealed server is left
+/// alone. With `--wait-secs N` it keeps trying for N seconds while the server is down or starting.
+async fn unseal_cmd(args: &[String]) -> Result<(), String> {
+    let url = match values(args, "--admin-url").as_slice() {
+        [] => "https://127.0.0.1:8444".to_owned(),
+        [one] => one.trim_end_matches('/').to_owned(),
+        _ => return Err("give --admin-url once".into()),
+    };
+    if !url.starts_with("https://") {
+        return Err("--admin-url must be https://: the shares cross it".into());
+    }
+    let wait = match values(args, "--wait-secs").as_slice() {
+        [] => 0,
+        [n] => n
+            .parse::<u64>()
+            .map_err(|_| "--wait-secs needs a number".to_owned())?,
+        _ => return Err("give --wait-secs once".into()),
+    };
+    let files = values(args, "--share-file");
+    if files.is_empty() {
+        return Err("give --share-file once per share (a file holding one share)".into());
+    }
+    // Read and check every share before touching the network: a typo fails here, not halfway through.
+    let mut shares = Vec::new();
+    for f in &files {
+        let text = secret_from_file(std::path::Path::new(f))?;
+        UnsealShare::from_text(&text)
+            .and_then(|s| s.info().map(|_| ()))
+            .map_err(|e| format!("{f}: {e}"))?;
+        shares.push(text);
+    }
+    let mut roots = Vec::new();
+    for pem in values(args, "--cacert") {
+        roots.push(std::fs::read(&pem).map_err(|e| format!("cannot read {pem}: {}", e.kind()))?);
+    }
+    let client = pvlt_server::import_opv::http_client(&roots).map_err(|e| e.to_string())?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    loop {
+        match unseal_once(&client, &url, &shares).await {
+            Ok(done) => {
+                eprintln!("{done}");
+                return Ok(());
+            }
+            Err(UnsealTry::Unreachable) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Err(UnsealTry::Unreachable) => {
+                return Err(format!(
+                    "cannot reach {url} (is the server up? --wait-secs waits)"
+                ));
+            }
+            Err(UnsealTry::Refused(why)) => return Err(why),
+        }
+    }
+}
+
+enum UnsealTry {
+    Unreachable,
+    Refused(String),
+}
+
+async fn sealed_status(client: &reqwest::Client, url: &str) -> Result<(bool, u64, u64), UnsealTry> {
+    let resp = client
+        .get(format!("{url}/v2/sys/status"))
+        .send()
+        .await
+        .map_err(|_| UnsealTry::Unreachable)?;
+    answer(resp).await
+}
+
+/// The `{sealed, threshold, submitted}` body, or the server's own error text.
+async fn answer(resp: reqwest::Response) -> Result<(bool, u64, u64), UnsealTry> {
+    let ok = resp.status().is_success();
+    let code = resp.status().as_u16();
+    let text = resp.text().await.map_err(|_| UnsealTry::Unreachable)?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        UnsealTry::Refused(format!(
+            "the server answered {code} with something that is not JSON"
+        ))
+    })?;
+    if !ok {
+        let why = v
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("refused");
+        return Err(UnsealTry::Refused(format!(
+            "the server refused ({code}): {why}"
+        )));
+    }
+    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Ok((
+        v.get("sealed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        n("threshold"),
+        n("submitted"),
+    ))
+}
+
+async fn unseal_once(
+    client: &reqwest::Client,
+    url: &str,
+    shares: &[zeroize::Zeroizing<String>],
+) -> Result<String, UnsealTry> {
+    let (sealed, threshold, _) = sealed_status(client, url).await?;
+    if !sealed {
+        return Ok("already unsealed".to_owned());
+    }
+    let mut sent = 0usize;
+    for share in shares {
+        let body =
+            zeroize::Zeroizing::new(serde_json::json!({ "share": share.as_str() }).to_string());
+        let resp = client
+            .post(format!("{url}/v2/sys/unseal"))
+            .header("content-type", "application/json")
+            .body(body.as_str().to_owned())
+            .send()
+            .await
+            .map_err(|_| UnsealTry::Unreachable)?;
+        sent += 1;
+        let (sealed, _, _) = answer(resp).await?;
+        if !sealed {
+            return Ok(format!("unsealed with {sent} share(s)"));
+        }
+    }
+    Err(UnsealTry::Refused(format!(
+        "sent {sent} share(s) and the server is still sealed: it needs {threshold}"
+    )))
 }
 
 /// `pvlt kms-remove`: deletes the KMS copy of the unseal key.
