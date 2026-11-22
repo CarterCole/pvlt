@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::app::GdprMode;
 use crate::bucket::S3Config;
+use crate::kms::KmsConfig;
 use pvlt_format::Id;
 use uuid::Uuid;
 
@@ -65,6 +66,9 @@ pub struct Config {
     /// GDPR mode and which of its parts are on (`PVLT_GDPR_MODE`, `PVLT_GDPR_EXPORT`,
     /// `PVLT_GDPR_ADMIN_INVENTORY`).
     pub gdpr: GdprMode,
+    /// The KMS that holds a wrapped copy of the unseal key, for auto-unseal (`PVLT_KMS_KEY_ID`, `PVLT_KMS_REGION`,
+    /// `PVLT_KMS_ENDPOINT`, `PVLT_KMS_ALLOW_HTTP`). `None`: unseal by hand with shares.
+    pub kms: Option<KmsConfig>,
     /// A plaintext data listener. Development builds only.
     #[cfg(feature = "dev-insecure")]
     pub insecure_listen: Option<SocketAddr>,
@@ -212,6 +216,28 @@ impl Env {
                 .parse()
                 .map_err(|_| bad(format!("{name} is not a whole number"))),
         }
+    }
+
+    /// The KMS settings, if `PVLT_KMS_KEY_ID` is set. A plain `http` endpoint needs `PVLT_KMS_ALLOW_HTTP=true`:
+    /// the key material crosses it.
+    fn kms(&self) -> Result<Option<KmsConfig>, ConfigError> {
+        let Some(key_id) = self.get("PVLT_KMS_KEY_ID") else {
+            return Ok(None);
+        };
+        let endpoint = self.get("PVLT_KMS_ENDPOINT").map(str::to_owned);
+        if let Some(e) = &endpoint
+            && !e.starts_with("https://")
+            && !(e.starts_with("http://") && self.flag("PVLT_KMS_ALLOW_HTTP")?)
+        {
+            return Err(bad(
+                "PVLT_KMS_ENDPOINT must be https:// (or http:// with PVLT_KMS_ALLOW_HTTP=true on a private network)",
+            ));
+        }
+        Ok(Some(KmsConfig {
+            key_id: key_id.to_owned(),
+            region: self.get("PVLT_KMS_REGION").map(str::to_owned),
+            endpoint,
+        }))
     }
 
     fn flag(&self, name: &str) -> Result<bool, ConfigError> {
@@ -394,6 +420,7 @@ impl Config {
                 export: env.flag_or("PVLT_GDPR_EXPORT", true)?,
                 admin_inventory: env.flag_or("PVLT_GDPR_ADMIN_INVENTORY", true)?,
             },
+            kms: env.kms()?,
             #[cfg(feature = "dev-insecure")]
             insecure_listen,
         })
@@ -658,5 +685,24 @@ mod tests {
         let c = Config::load(&env(&dev)).unwrap();
         assert!(matches!(c.storage, Storage::Directory(_)));
         assert_eq!(c.insecure_listen.map(|a| a.port()), Some(9));
+    }
+
+    #[test]
+    fn kms_is_off_unless_a_key_is_named_and_a_plain_http_endpoint_needs_a_flag() {
+        let files = Files::new("kms");
+        assert_eq!(Config::load(&env(&base(&files))).unwrap().kms, None);
+
+        let on = with(base(&files), "PVLT_KMS_KEY_ID", "alias/pvlt-unseal");
+        let kms = Config::load(&env(&on)).unwrap().kms.unwrap();
+        assert_eq!(kms.key_id, "alias/pvlt-unseal");
+        assert_eq!((kms.region, kms.endpoint), (None, None));
+
+        let http = with(on.clone(), "PVLT_KMS_ENDPOINT", "http://kms.internal:8080");
+        let err = Config::load(&env(&http)).unwrap_err().to_string();
+        assert!(err.contains("PVLT_KMS_ENDPOINT must be https://"), "{err}");
+        let allowed = with(http, "PVLT_KMS_ALLOW_HTTP", "true");
+        assert!(Config::load(&env(&allowed)).unwrap().kms.is_some());
+        let https = with(on, "PVLT_KMS_ENDPOINT", "https://kms.vpce.example.com");
+        assert!(Config::load(&env(&https)).unwrap().kms.is_some());
     }
 }

@@ -25,6 +25,7 @@ pub mod config;
 pub mod error;
 pub mod gdpr;
 pub mod import_opv;
+pub mod kms;
 pub mod pg;
 pub mod routes;
 pub mod secret;

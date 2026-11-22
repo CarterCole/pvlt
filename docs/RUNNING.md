@@ -39,6 +39,8 @@ All from the environment. A secret is a file named by `NAME_FILE`; a default bui
 | `PVLT_PRESIGN_TTL_SECS` (900) | how long a presigned upload or download address lives |
 | `PVLT_EXPIRY_INTERVAL_SECS` (300) | how often expired facts are shredded and unpublished ledger entries retried; 0 turns it off |
 | `PVLT_SWEEP_INTERVAL_SECS` (3600), `PVLT_SWEEP_GRACE_SECS` (3600) | the orphan-object sweeper |
+| `PVLT_KMS_KEY_ID` | enables auto-unseal: an AWS KMS key ARN or alias (see "Auto-unseal") |
+| `PVLT_KMS_REGION`, `PVLT_KMS_ENDPOINT`, `PVLT_KMS_ALLOW_HTTP` | the KMS region (default: the AWS SDK's), an endpoint override (a VPC endpoint), and `true` to allow a plain `http://` endpoint on a private network. Credentials come from the AWS default chain (instance, task or web-identity role). |
 | `PVLT_SCRATCH_DATABASE_URL_FILE` | an empty database, only for `pvlt scrub-backup` (or `PVLT_SCRATCH_DATABASE_URL`, with the same password rule) |
 
 **Use a separate ledger bucket.** The ledger is what makes a shred survive restoring an old backup, so it must be
@@ -59,13 +61,51 @@ Give each share to a different person. From a host that can reach the admin list
 curl --cacert cert.pem https://localhost:8444/v2/sys/unseal -d '{"share":"pvlt-share-v1:..."}'
 ```
 
-Repeat with different shares until `"sealed": false`. A restart is sealed again and needs the shares again.
+Repeat with different shares until `"sealed": false`. A restart is sealed again and needs the shares again, unless
+you set up auto-unseal (below).
 `POST /v2/sys/seal` (admin token) wipes the keys without stopping the process. `GET /readyz` on the data listener
 says which part is not ready: `sealed`, `key_store`, `object_store`, `ledger_in_sync`, `audit_ok`, `compat_policy`.
 
 **While sealed** the server answers `/healthz`, can replay the ledger and publish pending entries, and refuses
 everything else. Creating, reading **and shredding** need it unsealed: a ledger entry is signed with a key the
 root key unwraps, so erasure waits for an unseal.
+
+## Auto-unseal
+
+By default every restart is sealed until enough people send their shares. With **auto-unseal** the server unseals
+itself at start: the unseal key (the one the shares recover) is also wrapped by an AWS KMS key, and the wrapped
+copy is kept in the key store. The shares keep working, so the KMS is a convenience and never the only way in.
+Pick the share threshold you want at `pvlt init`: `--threshold 2 --shares 3` means any two of three people.
+
+```bash
+export PVLT_KMS_KEY_ID=alias/pvlt-unseal        # and PVLT_KMS_REGION; credentials from the instance or task role
+pvlt init --threshold 2 --shares 3 --kms        # a new vault: prints the shares and enrols the KMS
+# an existing vault: put two shares in two files (one share each), then
+pvlt kms-enroll --share-file share1.txt --share-file share2.txt
+```
+
+Enrolment recovers the unseal key from the shares once, has the KMS wrap it, **unwraps it again and opens the root
+key to prove the whole round trip**, and only then stores the record. A missing `kms:Decrypt` permission shows up
+there, not at the next restart. `pvlt kms-remove` forgets the KMS copy; the vault then unseals only with shares.
+
+* **What protects it.** Whoever may call `kms:Decrypt` on the key, with this vault's context, can open the vault.
+  Grant `kms:Encrypt` and `kms:Decrypt` on that one key to the server's role (and `Encrypt` to whoever enrols), put
+  the vault's root key id in a key policy condition if you like (`kms:EncryptionContext:root_key_id`), and watch
+  CloudTrail for `Decrypt` calls. The ciphertext is bound to this vault (the encryption context names the root
+  key) and to the key id you configure, so a record copied from another vault, or made under another key, is
+  refused.
+* **If the KMS is down at start**, the server starts sealed, logs the failure, and retries every 30 seconds until
+  it works or someone unseals it by hand. `/readyz` says `sealed` until then.
+* **Sealing stays possible.** `POST /v2/sys/seal` still wipes the keys; the vault stays sealed until the next start
+  (which unseals it again) or until shares are sent. An emergency seal is therefore not durable against a restart:
+  `pvlt kms-remove` first if you need that.
+* **A restore does not carry it.** The KMS record is deliberately not in a backup, because it ties the vault to one
+  KMS key in one environment. After `pvlt restore`, run `pvlt kms-enroll` again.
+* **What it costs.** With shares only, a stolen disk plus a stolen database cannot open the vault. With auto-unseal,
+  a stolen disk plus the KMS credentials can. A process that can already run code on the running host gains
+  nothing, since the unsealed keys are in its memory anyway. Shredding is unaffected: it destroys per-subject keys.
+* Only AWS KMS is supported so far. It is tested here against a protocol stand-in (`local-kms`), not against AWS
+  itself.
 
 ## Who may do what: issuers, tokens, policy
 
@@ -281,7 +321,7 @@ Python client. It removes both containers.
   downstream deployment's compose project, with fake data; it has not run in a real production deployment.
   `compose.yaml` is an example only: create the `pvlt` bucket first and set `PVLT_COMPAT_TOKEN_FILE` if you use
   `/api/v1`.
-* No KMS root-key provider (Shamir only), no certificate reload, no per-statement database timeouts, no separate
+* Auto-unseal supports AWS KMS only (no GCP, Azure or Vault), no certificate reload, no per-statement database timeouts, no separate
   database role for migrations.
 * `pvlt unseal` and `pvlt seal` are HTTP calls, not commands.
 * Blob upload from Python (client-side encryption) is not in the Python client.

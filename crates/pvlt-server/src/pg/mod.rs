@@ -12,4 +12,4 @@ mod dump;
 mod store;
 
 pub use dump::{BACKUP_TABLES, TableDump};
-pub use store::PgStore;
+pub use store::{KmsSeal, PgStore};
