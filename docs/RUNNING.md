@@ -95,8 +95,11 @@ to exist: unseal once before the first one.
 A token carries (all inside the part only the issuer can write): `expires` (required, within
 `PVLT_MAX_TOKEN_TTL_SECS`), `request_id`, optionally `caller`, `subject`, `role` (repeatable), `purpose`, `reason`,
 `action`, `resource_fact` / `resource_scope` / `resource_subject` (the one thing the token may touch), `grant`,
-and `approval`. A holder can **narrow** a token with attenuation blocks and cannot add anything: facts in later
-blocks are never read. The issuer's key id is the token's root key id.
+and `approval`. A holder can **narrow** a token with attenuation blocks and cannot add anything: a later block may
+hold only small checks, and a token whose later block holds a fact or a rule is refused. Each check may join at
+most two claims, so a check over three or more (say `time`, `action` and `resource_scope`) has to be split into
+separate checks; the full limits are in the `pvlt_server::tokens` module docs. An expired token is refused before
+any of its checks run. The issuer's key id is the token's root key id.
 
 ```bash
 pvlt mint-token --seed-file issuer.seed --key-id 1 --role verifier --caller user:77 \
