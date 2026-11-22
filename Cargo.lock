@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "pvlt-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "blahaj",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "pvlt-format"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "pvlt-mem"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "zeroize",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "pvlt-policy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pvlt-format",
  "serde",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "pvlt-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "aws-config",
