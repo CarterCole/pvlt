@@ -9,7 +9,9 @@ use pvlt_core::VaultError;
 use pvlt_core::audit::Auditor;
 use pvlt_core::engine::Engine;
 use pvlt_core::objects::ObjectStore;
-use pvlt_core::seal::{SealConfig, SealMode, UnsealShare, unseal_with_shares};
+use pvlt_core::seal::{
+    SealConfig, SealMode, UnsealKey, UnsealShare, unseal_with_key, unseal_with_shares,
+};
 use pvlt_core::store::{IssuerRecord, KeyStore};
 use pvlt_format::Id;
 use pvlt_policy::limits::RateLimiter;
@@ -352,6 +354,14 @@ impl<K: KeyStore, O: ObjectStore, A: Auditor> App<K, O, A> {
             self.engine.keyring().unseal(root);
         }
         Ok(self.unseal_status())
+    }
+
+    /// Unseals with an unseal key a KMS returned (auto-unseal). A key that does not open the root key is an
+    /// error and leaves the vault sealed.
+    pub fn unseal_with_key(&self, key: &UnsealKey) -> Result<(), VaultError> {
+        let root = unseal_with_key(self.engine.keyring().arena(), &self.seal_config, key)?;
+        self.engine.keyring().unseal(root);
+        Ok(())
     }
 
     /// Seals the vault: wipes the root key and every cached domain key, and forgets pending shares.

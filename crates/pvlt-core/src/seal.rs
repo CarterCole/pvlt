@@ -421,6 +421,67 @@ pub fn unseal_with_shares(
     RootKey::unwrap(arena, &unseal, &config.root)
 }
 
+/// The unseal key, recovered from enough shares. It exists to be wrapped by a KMS (auto-unseal enrolment) and
+/// then dropped: it is wiped when it goes out of scope, and it must not be stored anywhere else. Fails like
+/// [`unseal_with_shares`] when the shares are wrong, but never opens the root key.
+pub fn unseal_key_from_shares(
+    arena: &Arena,
+    config: &SealConfig,
+    shares: &[UnsealShare],
+) -> Result<UnsealKey, VaultError> {
+    let threshold = match &config.mode {
+        SealMode::Shamir { threshold, .. } => *threshold,
+        #[cfg(feature = "dev-insecure")]
+        SealMode::Passphrase(_) => {
+            return Err(VaultError::Invalid("this vault is not sealed with shares"));
+        }
+    };
+    for share in shares {
+        check_share(config, share)?;
+    }
+    let key = recover_unseal_key(threshold, &config.root.id, shares)?;
+    // Prove it is the right key before anything is wrapped under it: a wrong key would enrol a KMS that can
+    // never unseal.
+    drop(RootKey::unwrap(arena, &key, &config.root)?);
+    Ok(UnsealKey(key))
+}
+
+/// The key that wraps the root key, as raw bytes for a KMS to wrap. Wiped on drop; no `Clone`, and `Debug`
+/// prints nothing.
+pub struct UnsealKey(EphemeralKey);
+
+impl UnsealKey {
+    /// The 32 key bytes. Hand them to the KMS and drop this value.
+    pub fn expose(&self) -> &Key {
+        self.0.expose()
+    }
+
+    /// Rebuilds a key the KMS returned. Fails unless it is exactly 32 bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, VaultError> {
+        let key: Zeroizing<Key> = Zeroizing::new(
+            bytes
+                .try_into()
+                .map_err(|_| VaultError::Invalid("the unseal key has the wrong length"))?,
+        );
+        Ok(Self(EphemeralKey::from_key(&key)))
+    }
+}
+
+impl core::fmt::Debug for UnsealKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("UnsealKey(..)")
+    }
+}
+
+/// Opens the root key with an unseal key a KMS returned. A wrong key is [`VaultError::OpenFailed`].
+pub fn unseal_with_key(
+    arena: &Arena,
+    config: &SealConfig,
+    key: &UnsealKey,
+) -> Result<RootKey, VaultError> {
+    RootKey::unwrap(arena, &key.0, &config.root)
+}
+
 // --- Passphrase (development only) -----------------------------------------------------------------------
 
 #[cfg(feature = "dev-insecure")]

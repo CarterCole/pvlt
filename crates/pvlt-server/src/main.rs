@@ -8,12 +8,13 @@ use pvlt_core::audit::{AuditEvent, Auditor};
 use pvlt_core::engine::{Engine, Limits};
 use pvlt_core::keyring::Keyring;
 use pvlt_core::objects::SplitStore;
-use pvlt_core::seal::init_shamir;
+use pvlt_core::seal::{UnsealShare, init_shamir, unseal_key_from_shares, unseal_with_key};
 use pvlt_core::store::{KeyStore, StoreError};
 use pvlt_mem::{Arena, LockPolicy, harden_process};
 use pvlt_server::app::{Admin, App, Token};
 use pvlt_server::bucket::Bucket;
 use pvlt_server::config::{Config, Env, Storage};
+use pvlt_server::kms::{self, AwsKms, UnsealKms};
 use pvlt_server::pg::PgStore;
 use pvlt_server::tls::{Transport, load_tls, serve, stop_signal};
 use pvlt_server::{INSECURE_BUILD, admin, backup, routes, tools};
@@ -39,8 +40,16 @@ type Objects = SplitStore<Bucket, Bucket>;
 type Server = Engine<PgStore, Objects, LogAuditor>;
 
 const USAGE: &str = "usage:
-  pvlt init [--threshold N] [--shares N]    make the root key and print the unseal shares (once)
-  pvlt serve                                start the server, sealed; unseal it with POST /v2/sys/unseal
+  pvlt init [--threshold N] [--shares N] [--kms]
+                                            make the root key and print the unseal shares (once);
+                                            --kms also enrols auto-unseal (needs PVLT_KMS_KEY_ID)
+  pvlt serve                                start the server; unseals through the KMS if enrolled,
+                                            else sealed until POST /v2/sys/unseal
+  pvlt unseal --share-file F... [--admin-url URL] [--cacert PEM]... [--wait-secs N]
+                                            send shares to a sealed server (from a laptop, after a reboot);
+                                            --wait-secs waits for the server to come up; safe to repeat
+  pvlt kms-enroll --share-file F...         wrap the unseal key with the KMS (enough shares, one file each)
+  pvlt kms-remove                           forget the KMS copy; shares remain the only way to unseal
   pvlt backup --out FILE --recipient R... --signing-key-file FILE
                                             write a signed, encrypted backup of the key store
   pvlt restore --in FILE --identity FILE (--verify-key HEX | --allow-unsigned)
@@ -84,6 +93,9 @@ fn main() -> ExitCode {
     let rest = args.get(1..).unwrap_or_default();
     let outcome = match args.first().map(String::as_str) {
         Some("init") => runtime.block_on(init(rest)),
+        Some("unseal") => runtime.block_on(unseal_cmd(rest)),
+        Some("kms-enroll") => runtime.block_on(kms_enroll_cmd(rest)),
+        Some("kms-remove") if args.len() == 1 => runtime.block_on(kms_remove_cmd()),
         Some("serve") if args.len() == 1 => runtime.block_on(run()),
         Some("backup") => runtime.block_on(backup_cmd(rest)),
         Some("restore") => runtime.block_on(restore_cmd(rest)),
@@ -278,6 +290,218 @@ async fn init(args: &[String]) -> Result<(), String> {
     );
     for share in &init.shares {
         println!("{}", share.to_text().as_str());
+    }
+    if args.iter().any(|a| a == "--kms") {
+        let kms_config = config.kms.as_ref().ok_or(
+            "--kms needs PVLT_KMS_KEY_ID. The vault is initialised and the shares above are valid; set it and run \
+             `pvlt kms-enroll`",
+        )?;
+        let kms = AwsKms::new(kms_config).await;
+        let key = unseal_key_from_shares(&arena()?, &init.config, &init.shares)
+            .map_err(|e| e.to_string())?;
+        enroll_and_check(&store, &kms, &init.config, &key)
+            .await
+            .map_err(|e| {
+                format!("the vault is initialised and the shares above are valid, but auto-unseal was not enrolled ({e}); fix it and run `pvlt kms-enroll`")
+            })?;
+    }
+    Ok(())
+}
+
+/// Wraps the unseal key with the KMS, stores it, and proves the round trip: reads it back, unwraps it through
+/// the KMS and opens the root key, so a missing `kms:Decrypt` permission shows now and not at the next restart.
+async fn enroll_and_check<M: UnsealKms>(
+    store: &PgStore,
+    kms: &M,
+    seal: &pvlt_core::seal::SealConfig,
+    key: &pvlt_core::seal::UnsealKey,
+) -> Result<(), String> {
+    let record = kms::enroll(kms, &seal.root.id, key)
+        .await
+        .map_err(|e| format!("{e}: {}", e.detail()))?;
+    // Prove it before storing: a record that cannot be unwrapped would only look like auto-unseal.
+    let back = kms::recover(kms, &seal.root.id, &record)
+        .await
+        .map_err(|e| format!("{e}: {}", e.detail()))?;
+    unseal_with_key(&arena()?, seal, &back).map_err(|e| e.to_string())?;
+    store
+        .set_kms_seal(&record)
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "auto-unseal enrolled with {} key {}. The shares still work.",
+        record.provider, record.key_id
+    );
+    Ok(())
+}
+
+/// `pvlt kms-enroll`: recovers the unseal key from shares (read from files, not arguments), has the KMS wrap
+/// it and stores the result. Run once per vault, or again to change the KMS key.
+async fn kms_enroll_cmd(args: &[String]) -> Result<(), String> {
+    let config = Config::load_tool(&Env::from_process()).map_err(|e| e.to_string())?;
+    let kms_config = config.kms.as_ref().ok_or("PVLT_KMS_KEY_ID is required")?;
+    let _ = harden_process(false);
+    let store = connect(&config.database_url, false).await?;
+    let seal = store
+        .seal_config()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("the vault is not initialised: run `pvlt init`")?;
+    let files = values(args, "--share-file");
+    if files.is_empty() {
+        return Err("give --share-file once per share (a file holding one share)".into());
+    }
+    let mut shares = Vec::new();
+    for f in &files {
+        let text = secret_from_file(std::path::Path::new(f))?;
+        shares.push(UnsealShare::from_text(&text).map_err(|e| e.to_string())?);
+    }
+    let key = unseal_key_from_shares(&arena()?, &seal, &shares).map_err(|e| e.to_string())?;
+    drop(shares);
+    let kms = AwsKms::new(kms_config).await;
+    enroll_and_check(&store, &kms, &seal, &key).await
+}
+
+/// `pvlt unseal`: sends shares, read from files, to a sealed server's admin listener, so a laptop (or a job on
+/// one) can unseal after a reboot without anyone typing. It is safe to run again: an unsealed server is left
+/// alone. With `--wait-secs N` it keeps trying for N seconds while the server is down or starting.
+async fn unseal_cmd(args: &[String]) -> Result<(), String> {
+    let url = match values(args, "--admin-url").as_slice() {
+        [] => "https://127.0.0.1:8444".to_owned(),
+        [one] => one.trim_end_matches('/').to_owned(),
+        _ => return Err("give --admin-url once".into()),
+    };
+    if !url.starts_with("https://") {
+        return Err("--admin-url must be https://: the shares cross it".into());
+    }
+    let wait = match values(args, "--wait-secs").as_slice() {
+        [] => 0,
+        [n] => n
+            .parse::<u64>()
+            .map_err(|_| "--wait-secs needs a number".to_owned())?,
+        _ => return Err("give --wait-secs once".into()),
+    };
+    let files = values(args, "--share-file");
+    if files.is_empty() {
+        return Err("give --share-file once per share (a file holding one share)".into());
+    }
+    // Read and check every share before touching the network: a typo fails here, not halfway through.
+    let mut shares = Vec::new();
+    for f in &files {
+        let text = secret_from_file(std::path::Path::new(f))?;
+        UnsealShare::from_text(&text)
+            .and_then(|s| s.info().map(|_| ()))
+            .map_err(|e| format!("{f}: {e}"))?;
+        shares.push(text);
+    }
+    let mut roots = Vec::new();
+    for pem in values(args, "--cacert") {
+        roots.push(std::fs::read(&pem).map_err(|e| format!("cannot read {pem}: {}", e.kind()))?);
+    }
+    let client = pvlt_server::import_opv::http_client(&roots).map_err(|e| e.to_string())?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    loop {
+        match unseal_once(&client, &url, &shares).await {
+            Ok(done) => {
+                eprintln!("{done}");
+                return Ok(());
+            }
+            Err(UnsealTry::Unreachable) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Err(UnsealTry::Unreachable) => {
+                return Err(format!(
+                    "cannot reach {url} (is the server up? --wait-secs waits)"
+                ));
+            }
+            Err(UnsealTry::Refused(why)) => return Err(why),
+        }
+    }
+}
+
+enum UnsealTry {
+    Unreachable,
+    Refused(String),
+}
+
+async fn sealed_status(client: &reqwest::Client, url: &str) -> Result<(bool, u64, u64), UnsealTry> {
+    let resp = client
+        .get(format!("{url}/v2/sys/status"))
+        .send()
+        .await
+        .map_err(|_| UnsealTry::Unreachable)?;
+    answer(resp).await
+}
+
+/// The `{sealed, threshold, submitted}` body, or the server's own error text.
+async fn answer(resp: reqwest::Response) -> Result<(bool, u64, u64), UnsealTry> {
+    let ok = resp.status().is_success();
+    let code = resp.status().as_u16();
+    let text = resp.text().await.map_err(|_| UnsealTry::Unreachable)?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        UnsealTry::Refused(format!(
+            "the server answered {code} with something that is not JSON"
+        ))
+    })?;
+    if !ok {
+        let why = v
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("refused");
+        return Err(UnsealTry::Refused(format!(
+            "the server refused ({code}): {why}"
+        )));
+    }
+    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Ok((
+        v.get("sealed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        n("threshold"),
+        n("submitted"),
+    ))
+}
+
+async fn unseal_once(
+    client: &reqwest::Client,
+    url: &str,
+    shares: &[zeroize::Zeroizing<String>],
+) -> Result<String, UnsealTry> {
+    let (sealed, threshold, _) = sealed_status(client, url).await?;
+    if !sealed {
+        return Ok("already unsealed".to_owned());
+    }
+    let mut sent = 0usize;
+    for share in shares {
+        let body =
+            zeroize::Zeroizing::new(serde_json::json!({ "share": share.as_str() }).to_string());
+        let resp = client
+            .post(format!("{url}/v2/sys/unseal"))
+            .header("content-type", "application/json")
+            .body(body.as_str().to_owned())
+            .send()
+            .await
+            .map_err(|_| UnsealTry::Unreachable)?;
+        sent += 1;
+        let (sealed, _, _) = answer(resp).await?;
+        if !sealed {
+            return Ok(format!("unsealed with {sent} share(s)"));
+        }
+    }
+    Err(UnsealTry::Refused(format!(
+        "sent {sent} share(s) and the server is still sealed: it needs {threshold}"
+    )))
+}
+
+/// `pvlt kms-remove`: deletes the KMS copy of the unseal key.
+async fn kms_remove_cmd() -> Result<(), String> {
+    let config = Config::load_tool(&Env::from_process()).map_err(|e| e.to_string())?;
+    let store = connect(&config.database_url, false).await?;
+    if store.clear_kms_seal().await.map_err(|e| e.to_string())? {
+        eprintln!("auto-unseal removed: the vault now unseals only with shares");
+    } else {
+        eprintln!("auto-unseal was not enrolled");
     }
     Ok(())
 }
@@ -547,6 +771,11 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?
         .ok_or("the vault is not initialised: run `pvlt init`")?;
+    let kms_seal = if config.kms.is_some() {
+        store.kms_seal().await.map_err(|e| e.to_string())?
+    } else {
+        None
+    };
     let engine = engine(&config, store)?;
 
     // Before any listener opens: make the key store agree with the ledger in the bucket. A key store restored
@@ -597,6 +826,27 @@ async fn run() -> Result<(), String> {
     app.reload_access()
         .await
         .map_err(|e| format!("cannot load issuers and policy: {e}"))?;
+    match (&config.kms, kms_seal) {
+        (Some(kms_config), Some(seal)) => {
+            let aws = AwsKms::new(kms_config).await;
+            match kms::try_unseal(&app, &aws, &seal).await {
+                Ok(()) => tracing::info!(key = %seal.key_id, "unsealed through the KMS"),
+                Err(e) => {
+                    tracing::error!(error = %e, detail = %e.detail(), "auto-unseal failed; retrying (the shares still unseal it)");
+                    tokio::spawn(kms::keep_trying(
+                        Arc::clone(&app),
+                        aws,
+                        seal,
+                        std::time::Duration::from_secs(30),
+                    ));
+                }
+            }
+        }
+        (Some(_), None) => tracing::warn!(
+            "PVLT_KMS_KEY_ID is set but the vault is not enrolled: unseal with shares, then run `pvlt kms-enroll`"
+        ),
+        (None, _) => {}
+    }
     if app.admins.len() < 2 {
         tracing::warn!(
             "fewer than two admins are configured, so dual-control approvals cannot be granted, and policy and \

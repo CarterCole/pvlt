@@ -1812,6 +1812,65 @@ impl KeyStore for PgStore {
     }
 }
 
+/// The unseal key wrapped by a KMS: ciphertext, and which KMS key made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KmsSeal {
+    /// The root key this unseal key opens.
+    pub root_key_id: Id,
+    /// The KMS provider, `aws-kms`.
+    pub provider: String,
+    /// The KMS key that wrapped it (an ARN or alias, as configured when it was enrolled).
+    pub key_id: String,
+    /// The KMS's ciphertext. Useless without decrypt permission on that key.
+    pub wrapped: Vec<u8>,
+}
+
+impl PgStore {
+    /// The stored auto-unseal record, if the vault was enrolled.
+    pub async fn kms_seal(&self) -> Result<Option<KmsSeal>, StoreError> {
+        let row = sqlx::query("SELECT root_key_id, provider, key_id, wrapped FROM seal_kms")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+        row.map(|row| {
+            Ok(KmsSeal {
+                root_key_id: fixed(get::<Vec<u8>>(&row, "root_key_id")?, "kms seal root key id")?,
+                provider: get(&row, "provider")?,
+                key_id: get(&row, "key_id")?,
+                wrapped: get(&row, "wrapped")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Stores the auto-unseal record, replacing an earlier one (enrolling again with another KMS key).
+    pub async fn set_kms_seal(&self, seal: &KmsSeal) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO seal_kms (root_key_id, provider, key_id, wrapped) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (singleton) DO UPDATE SET root_key_id = EXCLUDED.root_key_id, \
+             provider = EXCLUDED.provider, key_id = EXCLUDED.key_id, wrapped = EXCLUDED.wrapped, \
+             created_at = now()",
+        )
+        .bind(seal.root_key_id.as_slice())
+        .bind(&seal.provider)
+        .bind(&seal.key_id)
+        .bind(&seal.wrapped)
+        .execute(&self.pool)
+        .await
+        .map(drop)
+        .map_err(|e| insert_error(e, &[], StoreError::Conflict("record violates a constraint")))
+    }
+
+    /// Removes the auto-unseal record. Returns whether there was one.
+    pub async fn clear_kms_seal(&self) -> Result<bool, StoreError> {
+        let done = sqlx::query("DELETE FROM seal_kms")
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(done.rows_affected() > 0)
+    }
+}
+
 impl PgStore {
     /// Why an update of an active fact touched nothing: there is no such fact, or it is shredded.
     async fn missing_or_shredded(

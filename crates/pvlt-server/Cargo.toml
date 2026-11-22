@@ -53,6 +53,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde"] }
 zeroize = "1.8"
 time = { version = "0.3", default-features = false, features = ["std"] }
+aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1.111", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 [dev-dependencies]
 rcgen = "0.14"

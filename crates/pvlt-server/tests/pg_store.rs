@@ -67,10 +67,53 @@ async fn migrations_are_repeatable_and_make_the_tables() {
             "ledger",
             "policies",
             "seal_config",
+            "seal_kms",
             "sign_keys",
             "subject_keys"
         ]
     );
+    db.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PVLT_TEST_DATABASE_URL; run scripts/test-db.sh start"]
+async fn the_kms_seal_is_stored_replaced_and_removed_and_a_backup_leaves_it_out() {
+    use pvlt_server::pg::{BACKUP_TABLES, KmsSeal};
+    let db = TestDb::new().await;
+    assert_eq!(db.store.kms_seal().await.unwrap(), None);
+    let one = KmsSeal {
+        root_key_id: [7; 16],
+        provider: "aws-kms".into(),
+        key_id: "alias/pvlt-unseal".into(),
+        wrapped: vec![1, 2, 3],
+    };
+    db.store.set_kms_seal(&one).await.unwrap();
+    assert_eq!(db.store.kms_seal().await.unwrap(), Some(one.clone()));
+    // Enrolling again (another KMS key) replaces the one record; there is never more than one.
+    let two = KmsSeal {
+        key_id: "alias/other".into(),
+        wrapped: vec![9; 40],
+        ..one
+    };
+    db.store.set_kms_seal(&two).await.unwrap();
+    assert_eq!(db.store.kms_seal().await.unwrap(), Some(two));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM seal_kms")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    // The database refuses a provider this build does not know and an empty ciphertext.
+    for bad in [
+        "INSERT INTO seal_kms (singleton, root_key_id, provider, key_id, wrapped) VALUES (false, '\\x00112233445566778899aabbccddeeff', 'aws-kms', 'k', '\\x01')",
+        "UPDATE seal_kms SET provider = 'mystery'",
+        "UPDATE seal_kms SET wrapped = ''::bytea",
+    ] {
+        refused_with(db.pool(), bad).await;
+    }
+    assert!(!BACKUP_TABLES.contains(&"seal_kms"));
+    assert!(db.store.clear_kms_seal().await.unwrap());
+    assert!(!db.store.clear_kms_seal().await.unwrap());
+    assert_eq!(db.store.kms_seal().await.unwrap(), None);
     db.finish().await;
 }
 
